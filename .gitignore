@@ -1,0 +1,11 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+data/
+data_final/
+data_out/
+figures/
+thesis_docs/
+src/old_src/
+*.Rproj

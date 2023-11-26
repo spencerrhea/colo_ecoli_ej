@@ -1,0 +1,562 @@
+---
+title: "flood_model_upt"
+author: "Spencer Rhea"
+date: "7/27/2020"
+output: 
+  html_document:
+    toc: TRUE
+    toc_depth: 1
+    toc_float: TRUE
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(include = FALSE)
+library(raster)
+library(feather)
+library(tidyverse)
+library(stringr)
+library(ggpubr)
+library(viridis)
+library(sf)
+library(FedData)
+library(mapview)
+library(lubridate)
+library(feather)
+library(tidycensus)
+library(USAboundaries)
+library(ggthemes)
+library(ggplot2)
+library(kableExtra)
+library(knitr)
+library(tmap)
+library(tmaptools)
+library(RColorBrewer)
+library(nhdplusTools)
+```
+
+
+```{r}
+# Read in raw e.coli data
+ecoli_raw <- read_feather("/Users/spencerrhea/Google Drive/EJ_paper /data/wq_data/Colorado_ecoli.feather")
+
+# Read in inventory
+inv <- read_feather('/Users/spencerrhea/Google Drive/EJ_paper /data/wq_data/test/wqp_inv.feather') %>%
+    select(SiteID=MonitoringLocationIdentifier,
+           resultCount,
+           parameter,
+                  lat,
+                  lon) %>%
+  distinct() %>%
+  filter(!is.na(lat),
+         !is.na(lon)) %>%
+  st_as_sf(.,coords=c('lon','lat'),crs=4326) %>%
+  distinct(SiteID)
+
+# clean e.coli data
+clean_ecoli <-  ecoli_raw %>%
+                  dplyr::select(date=ActivityStartDate,
+                         parameter=CharacteristicName,
+                         units=ResultMeasure.MeasureUnitCode,
+                         SiteID=MonitoringLocationIdentifier,
+                         org=OrganizationFormalName,
+                         org_id=OrganizationIdentifier,
+                         time=ActivityStartTime.Time,
+                         raw_value=ResultMeasureValue,
+                         sample_method=SampleCollectionMethod.MethodName,
+                         analytical_method=ResultAnalyticalMethod.MethodName,
+                         particle_size=ResultParticleSizeBasisText,
+                         date_time=ActivityStartDateTime,
+                         media=ActivityMediaName,
+                         sample_depth=ActivityDepthHeightMeasure.MeasureValue,
+                         sample_depth_unit=ActivityDepthHeightMeasure.MeasureUnitCode,
+                         fraction=ResultSampleFractionText,
+                         status=ResultStatusIdentifier) %>%
+  mutate(units = trimws(units)) %>%
+  #Keep only samples that are water samples
+  filter(media=='Water') %>%
+  filter(units != "ug/l")
+
+# Removed filter for log mean 
+ecoli_mean <- clean_ecoli %>%
+  filter(year(date) >= 2005 & year(date) <= 2015) %>%
+  filter(parameter == "Escherichia coli") %>%
+  group_by(SiteID) %>%
+  summarize(mean = mean(raw_value,na.rm=T) %>% round(.,2),
+            raw_mean = mean(raw_value,na.rm=T),
+            sd = sd(raw_value, na.rm = T),
+            count=n()) %>%
+  filter(count > 9) %>% 
+  #filter(sd < 5) %>%
+  mutate(log_mean=log10(mean)) %>%
+  filter(log_mean > 0.0000001)
+
+ecoli_mean_sf <- inv %>%
+  right_join(.,ecoli_mean,by='SiteID') %>%
+  st_transform(2163) 
+
+ecoli_mean_sf_50m <- ecoli_mean_sf %>%
+  st_buffer(50)
+
+ecoli_mean_sf_100m <- ecoli_mean_sf %>%
+  st_buffer(100)
+
+ecoli_3km <- ecoli_mean_sf %>%
+  st_buffer(3000)
+```
+
+```{r}
+nhd <- st_read('/Users/spencerrhea/Google Drive/EJ_paper /data/nhd/NHDPlus/download.gpkg', "NHDFlowline_Network") %>%
+  st_transform(2163) %>%
+  filter(streamorde > 1)
+
+river_sites <- st_join(ecoli_mean_sf_100m, nhd)
+
+river_site <- river_sites %>%
+  filter(!is.na(id)) %>%
+  pull(SiteID) %>%
+  unique()
+
+river_ecoli <- ecoli_3km %>%
+  filter(SiteID %in% river_site)
+```
+
+```{r}
+census <- read_rds("/Users/spencerrhea/Google Drive/EJ_paper /data/census.rds") %>%
+  st_transform(2163)
+
+city_geom <- get_acs(geography = "metropolitan statistical area/micropolitan statistical area", variables = "B01003_001", year = 2013, geometry = T) %>%
+  filter(NAME %in% c("Fort Collins, CO Metro Area", "Boulder, CO Metro Area", "Denver-Aurora-Lakewood, CO Metro Area", "Colorado Springs, CO Metro Area", "Pueblo, CO Metro Area")) %>%
+  st_transform(2163)
+
+denver_metro <- c(' Denver County',  ' Arapahoe County', ' Jefferson County', ' Adams County', ' Douglas County', ' Broomfield County', ' Elbert County', ' Park County', ' Clear Creek County',  ' Gilpin County')
+
+```
+
+```{r}
+census_ecoli <- function(df_census, ecoli) {
+colorado_3km_ecoli <- st_join(df_census, ecoli) %>%
+  mutate(data_avail = ifelse(!is.na(mean),'has_data','no_data')) %>%
+  mutate(data_avail = as.factor(data_avail)) 
+
+#Removing sites where there is overlap
+grouped_3km <- colorado_3km_ecoli %>%
+  filter(data_avail == "has_data") %>%
+  mutate(weighted_income = median_income*population) %>%
+  mutate(weighted_mean = mean*count) %>%
+  group_by(SiteID) %>%
+  summarise(color = sum(color, na.rm = T),
+            mean = mean(mean, na.rm = T),
+            weighted_mean = mean(weighted_mean, na.rm = T),
+            mean_n = mean(count, na.rm = T),
+            total = sum(population, na.rm = T),
+            percent_color = (color/total)*100,
+            income = sum(weighted_income, na.rm = T)/sum(total),
+            renters = sum(renters, na.rm = T),
+            tenure_total = sum(tenure_total, na.rm = T),
+            degrees = sum(degrees, na.rm = T),
+            education = sum(education_25_total, na.rm = T),
+            percent_renters = sum(renters, na.rm = T)/sum(tenure_total, na.rm = T),
+            percent_degree = sum(degrees, na.rm = T)/sum(education_25_total, na.rm = T),
+            age = mean(median_age, na.rm = T),
+            gini = mean(estimate_gini_index, na.rm = T),
+            percent_black = (sum(estimate_black, na.rm = T)/sum(population, na.rm = T))*100,
+            percent_hispanic = (sum(estimate_hispanic, na.rm = T)/sum(population))*100,
+            percent_asain = (sum(estimate_asian, na.rm = T)/sum(population, na.rm = T))*100,
+            percent_native = (sum(estimate_native, na.rm = T)/sum(population, na.rm = T))*100,
+            percent_other_mixed = (sum(estimate_other, na.rm = T)+sum(estimate_two_or_more))/sum(population, na.rm = T)*100,
+            percent_hawaiian = sum(estimate_hawaiian, na.rm = T)/sum(population, na.rm = T)*100) %>%
+  #Regroup by income
+  group_by(income) %>%
+  summarise(mean = sum(weighted_mean, na.rm = T)/sum(mean_n, na.rm = T),
+            percent_color = sum(color)/sum(total)*100,
+            percent_renters = sum(renters, na.rm = T)/sum(tenure_total, na.rm = T)*100,
+            percent_degrees = sum(degrees, na.rm = T)/sum(education, na.rm = T)*100) 
+
+grouped_3km_lm <- grouped_3km %>%
+  mutate(log_color = log(percent_color+1),
+         log_renters = log(percent_renters+1),
+         log_degrees = log(percent_degrees+1),
+         log_mean = log(mean),
+         log_income = log(income)) %>%
+  select(log_mean, log_color, log_renters, log_degrees, log_income)
+
+return(grouped_3km_lm) }
+```
+
+
+```{r}
+## Fort Collins and Boulder
+ft_cenus <- census %>%
+  separate_rows(NAME, sep = ',') %>%
+  filter(NAME == ' Larimer County') 
+
+ft_mean <- st_join(ft_cenus, river_ecoli)  
+
+ft_mean <- unique(ft_mean$mean)
+
+ft_fin <- census_ecoli(ft_cenus, river_ecoli)
+
+summary(lm(log_mean ~ log_color+log_renters+log_income+log_degrees, ft_fin))
+
+ft_collins <- tibble("Inputs Parameters" = c("Intercept", "Log Percent People of Color", "Log Percent Renters", "Log Median Income", "Log Percent Collage Degrees", "Ecoli Median conc"),
+       "Estimates" = c(-58.4186, -0.9738, 0.9317, 6.4570, -2.5516, 40),
+       "pvalue" = c(0.242, 0.415, 0.433, 0.287, 0.646, 0.005),
+       "Location" = "Fort Collins")
+```
+
+```{r}
+## Fort Collins and Boulder
+boulder_cenus <- census %>%
+  separate_rows(NAME, sep = ',') %>%
+  filter(NAME == ' Boulder County') 
+
+boulder_mean <- st_join(boulder_cenus, river_ecoli)  
+
+bould_mean <- unique(boulder_mean$mean)
+
+boulder_fin <- census_ecoli(boulder_cenus, river_ecoli)
+
+summary(lm(log_mean ~ log_color+log_renters+log_income+log_degrees, boulder_fin))
+
+boulder_census <- tibble("Inputs Parameters" = c("Intercept", "Log Percent People of Color", "Log Percent Renters", "Log Median Income", "Log Percent Collage Degrees", "Ecoli Median conc"),
+       "Estimates" = c(-35.1511, 1.4682, 1.5515, 3.9312, -3.4268, 34),
+       "pvalue" = c(0.172, 0.106, 0.187, 0.109, 0.236, 0.005),
+       "Location" = "Boulder")
+```
+
+
+```{r}
+## Denver
+den_metro <- census %>%
+  separate_rows(NAME, sep = ',') %>%
+  filter(NAME %in% denver_metro)
+
+denver_mean <- st_join(den_metro, river_ecoli)  
+
+denver_mean_v <- unique(denver_mean$mean)
+
+den_metro_final <- census_ecoli(den_metro, river_ecoli)
+
+summary(lm(log_mean ~ log_color+log_renters+log_income+log_degrees, den_metro_final))
+
+denver <- tibble("Inputs Parameters" = c("Intercept", "Log Percent People of Color", "Log Percent Renters", "Log Median Income", "Log Percent Collage Degrees", "Ecoli Median conc"),
+       "Estimates" = c(1.8605, 2.0413, -0.2456, -0.6614, 1.2030, 63),
+       "pvalue" = c(0.7070, 0.00005, 0.2616, 0.2315, 0.0188, 0.005),
+       "Location" = "Denver Metro")
+```
+
+
+```{r}
+## Colorado Springs
+colo_spgs <- census %>%
+  separate_rows(NAME, sep = ',') %>%
+  filter(NAME %in% ' El Paso County')
+
+colo_mean <- st_join(colo_spgs, river_ecoli)  
+
+colo_mean_v <- unique(colo_mean$mean)
+
+colo_spgs_final <- census_ecoli(colo_spgs, river_ecoli)
+
+summary(lm(log_mean ~ log_color+log_renters+log_income+log_degrees, colo_spgs_final))
+
+colospgs <- tibble("Inputs Parameters" = c("Intercept", "Log Percent People of Color", "Log Percent Renters", "Log Median Income", "Log Percent Collage Degrees", "Ecoli Median conc"),
+       "Estimates" = c(-48.6162, 0.9530, 3.2317, 3.8947, -0.5549, 1350),
+       "pvalue" = c(0.0336, 0.1363, 0.0155, 0.0761, 0.7421, 0.005),
+       "Location" = "Colorado Springs")
+```
+
+
+
+```{r}
+## Pueblo
+pueblo <- census %>%
+  separate_rows(NAME, sep = ',') %>%
+  filter(NAME %in% ' Pueblo County')
+
+pueblo_mean <- st_join(pueblo, river_ecoli)  
+
+pueblo_mean_v <- unique(pueblo_mean$mean)
+
+pueblo_final <- census_ecoli(pueblo, river_ecoli)
+
+summary(lm(log_mean ~ log_color+log_renters+log_income+log_degrees, pueblo_final))
+
+purblo_tb <- tibble("Inputs Parameters" = c("Intercept", "Log Percent People of Color", "Log Percent Renters", "Log Median Income", "Log Percent Collage Degrees", "Ecoli Median conc"),
+       "Estimates" = c(10.720, 5.289, -2.279, -2.890, 3.846, 222),
+       "pvalue" = c(0.6947, 0.0155, 0.2166, 0.3622, 0.2417, 0.005),
+       "Location" = "Pueblo")
+```
+
+
+```{r}
+## Global 
+ftr <- c(' Denver County',  ' Arapahoe County', ' Jefferson County', ' Adams County', ' Douglas County', ' Broomfield County', ' Elbert County', ' Park County', ' Clear Creek County',  ' Gilpin County', ' Larimer County', ' Boulder County', ' El Paso County', ' Pueblo County')
+
+front_census <- census %>%
+  separate_rows(NAME, sep = ',') %>%
+  filter(NAME %in% ftr)
+
+census_mean <- st_join(front_census, river_ecoli)  
+
+front_mean_v <- unique(census_mean$mean)
+
+census_final <- census_ecoli(front_census, river_ecoli)
+
+summary(lm(log_mean ~ log_color+log_renters+log_income+log_degrees, census_final))
+
+front_range <- tibble("Inputs Parameters" = c("Intercept", "Log Percent People of Color", "Log Percent Renters", "Log Median Income", "Log Percent Collage Degrees", "Ecoli Median conc"),
+       "Estimates" = c(0.5624, 1.2626, 0.6882, -0.4914, 0.9936, 131),
+       "pvalue" = c(0.91477, 0.0005, 0.00797, 0.38890, 0.07881, 0.005),
+       "Location" = "Front Range")
+```
+
+
+# Ecoli Model Output
+
+### Updated model including only ecoli sites on river (no reservoirs or lakes). I also lumped Boulder and Fort Collins because of their low number of sites and similar attributes. I only included model parameters that were significant, so NA values are not significant. One thing that changed by combining Boulder and Fort Collins is that now percent renters and percent of people with college degrees are significant. These results for Fort Collins and Boulder can be seen as a 1% increase in the percent of renters in an area will increase the ecoli concentration by 1.9%. 
+
+```{r, include=TRUE, message=FALSE}
+cities <- rbind(ft_collins, boulder_census, denver, colospgs, purblo_tb, front_range) 
+
+all_cities <- cities %>%
+  mutate(Estimates = ifelse(pvalue >= 0.05, NA, Estimates)) %>%
+  #mutate(pvalue = ifelse(pvalue >= 0.05, NA, pvalue)) %>%
+  select(-pvalue) %>%
+  mutate(Estimates = round(Estimates, 2)) %>%
+  pivot_wider(names_from = 'Location', values_from = 'Estimates') 
+
+#write_csv(all_cities, 'data_out/model_final.csv')
+
+all_cities %>%
+  kable() %>% 
+  kable_styling(full_width = T) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(6, color = 'white', background = '#000000')
+```
+
+
+```{r, eval=FALSE}
+# flood
+codes <- c(population = "B01003_001",
+           median_income = "B19013_001",
+           gini_index = "B19083_001",
+           median_age = "B01002_001",
+           education_25_total = "B15003_001",
+           hs_diploma = "B15003_017",
+           GED = "B15003_018",
+           some_college_1year = "B15003_019",
+           some_college = "B15003_020",
+           associates = "B15003_021",
+           bachelors = "B15003_022",
+           masters = "B15003_023",
+           professional = "B15003_024",
+           doctoral = "B15003_025",
+           tenure_total = "B25003_001",
+           renters = "B25003_003",
+           owners = "B25003_002",
+           sex_total = "B01001_001",
+           male = "B01001_002",
+           female = "B01001_026",
+           race_total = "B03002_001",
+           white = "B03002_003",
+           black = "B03002_004",
+           native = "B03002_005",
+           asian = "B03002_006",
+           hawaiian = "B03002_007",
+           other = "B03002_008",
+           two_or_more = "B03002_009",
+           hispanic = "B03002_012")
+
+#Download block group geometries from tidycensus package 
+zip_geom <- get_acs(geography = "zip code tabulation area", variables = "B01003_001", year = 2013, geometry = T) %>%
+  select(GEOID, geometry)
+
+#Download block group census data
+zip_sf <- get_acs(geography = "zip code tabulation area", codes, year = 2013, geometry = F) 
+
+zip_sf <- zip_sf %>%
+  select(-moe) %>%
+  pivot_wider(names_from = variable, values_from = estimate)
+
+zip_full <- full_join(zip_geom, zip_sf) 
+
+flood <- read_csv('data/flood.csv') %>%
+  filter(state == 'co') %>%
+  select(ZipCode, fs_pct_2020=7, fc_pct_2035=9, fc_oct_2050=11, total_prop=3, fc_total_risk=6) %>%
+  mutate(ZipCode = as.character(ZipCode))
+
+co_zip_codes <- flood$ZipCode
+
+co_zip <- zip_full %>%
+  filter(GEOID %in% co_zip_codes) %>%
+  rename(ZipCode = GEOID) %>%
+  mutate(percent_poc = ((black+native+asian+hawaiian+other+two_or_more+hispanic)/race_total)*100,
+         percent_degrees = ((associates+bachelors+masters+professional+doctoral)/education_25_total)*100,
+         percent_renters = (renters/tenure_total)*100) %>%
+  select(ZipCode, percent_poc, percent_degrees, percent_renters, median_income) %>%
+  left_join(flood)
+
+counties <- front_census %>% 
+  select(NAME) %>%
+  mutate(place = case_when(NAME %in% ft_boulder ~ 'fc_boulder',
+                           NAME %in% denver_metro ~ 'Denver',
+                           NAME == ' Pueblo County' ~ 'Pueblo',
+                           NAME == ' El Paso County' ~ 'Colo_spgs')) %>%
+  group_by(place) %>%
+  summarise() %>%
+  st_transform(4269)
+  
+flood_sf <- st_join(co_zip, counties) %>%
+  filter(!is.na(place)) %>%
+  mutate(percent_poc_log = log(percent_poc+1),
+         percent_degrees_log = log(percent_degrees+1),
+         percent_renters_log = log(percent_renters+1),
+         median_income_log = log(median_income),
+         fs_pct_2020_log = log(fs_pct_2020+1),
+         fs_pct_2035_log = log(fc_pct_2035+1),
+         fc_pct_2050_log = log(fc_oct_2050+1))
+
+#write_rds(flood_sf, "data_out/flood_census.rds")
+
+```
+
+# Flood Risk
+### The First Street Foundation data for flooding risk was only available at a zip code level summary. So I plotted and ran simple linear models for relationship between the percent of properties in a zip code and the four demographic variables. All significant estimates (p-value less than 0.05) are included in the table below. I also included all of the plots as well. The table also includes the percent of properties in each city that are at risk of flooding. 
+
+### For some reason most of the zip codes in Pueblo were not included in the data I received from the First Street Foundation, so it may not be possible to draw conclusions about Pueblo.
+
+```{r, include=TRUE}
+flood_sf <- read_rds("/Users/spencerrhea/Google Drive/EJ_paper /data_out/flood_census.rds")
+
+den_sf <- flood_sf %>%
+  filter(place == 'Denver')
+
+colo_spgs_sf <- flood_sf %>%
+  filter(place == 'Colo_spgs')
+
+pueblo_sf <- flood_sf %>%
+  filter(place == 'Pueblo')
+
+ftb_sf <- flood_sf %>%
+  filter(place == 'fc_boulder')
+
+# #fc + boulder
+# sum(ftb_sf$total_prop, na.rm = T)/sum(ftb_sf$fc_total_risk, na.rm = T)
+# #Denver
+# sum(den_sf$total_prop, na.rm = T)/sum(den_sf$fc_total_risk, na.rm = T)
+# #colo spgs
+# sum(colo_spgs_sf$total_prop, na.rm = T)/sum(colo_spgs_sf$fc_total_risk, na.rm = T)
+# #pueblo
+# sum(pueblo_sf$total_prop, na.rm = T)/sum(pueblo_sf$fc_total_risk, na.rm = T)
+# #Front Range 
+# sum(flood_sf$total_prop, na.rm = T)/sum(flood_sf$fc_total_risk, na.rm = T)
+
+# summary(lm(fs_pct_2020_log ~ median_income_log, ftb_sf))
+
+flood_models <- tibble(
+  "Input" = c("Log Percent POC", "Log Percent Renters", "Log Median Income", "Log Degrees", "Percent of Properties with Flood Risk"),
+  "Fort Collins + Boulder" = c(-0.45, NA, NA, NA, 17),
+  "Denver Metro" = c(-0.44, -0.30, NA, -0.24, 25),
+  "Colorado Springs" = c(NA, NA, NA, NA, 15),
+  "Pueblo" = c(NA, NA, NA, NA, 15),
+  "Front Range" = c(-0.37, -0.22, NA, NA, 21)
+)
+
+flood_models %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(5, color = 'white', background = '#000000')
+```
+
+## Fort Collins and Boulder
+```{r, include=TRUE, warning=FALSE}
+ftb_sf %>%
+  as.data.frame() %>%
+  select(-geometry) %>%
+  select(percent_poc_log, percent_degrees_log, percent_renters_log, median_income_log, fs_pct_2020_log) %>%
+  pivot_longer(cols = c('percent_poc_log', 'percent_degrees_log', 'percent_renters_log', 'median_income_log')) %>%
+  ggplot(aes(x = value, y = fs_pct_2020_log)) +
+  geom_point() +
+  facet_wrap(~name, scales = "free") +
+  stat_smooth(method = 'lm') +
+  theme_few() +
+  scale_y_continuous(breaks=c(1.609438, 2.302585, 3.218876,4.317488), labels=c(5, 10, 25, 75)) +
+  labs(x = "Percent or median income (log transformed)",
+       y = 'Percent of Properties at Flood Risk (log transformed)')
+```
+
+## Denver
+```{r, include=TRUE, warning=FALSE}
+den_sf %>%
+  as.data.frame() %>%
+  select(-geometry) %>%
+  select(percent_poc_log, percent_degrees_log, percent_renters_log, median_income_log, fs_pct_2020_log) %>%
+  pivot_longer(cols = c('percent_poc_log', 'percent_degrees_log', 'percent_renters_log', 'median_income_log')) %>%
+  ggplot(aes(x = value, y = fs_pct_2020_log)) +
+  geom_point() +
+  facet_wrap(~name, scales = "free") +
+  stat_smooth(method = 'lm') +
+  theme_few() +
+  scale_y_continuous(breaks=c(1.609438, 2.302585, 3.218876,4.317488), labels=c(5, 10, 25, 75)) +
+  labs(x = "Percent or median income (log transformed)",
+       y = 'Percent of Properties at Flood Risk (log transformed)')
+```
+
+## Colorado Springs
+```{r, include=TRUE, warning=FALSE}
+colo_spgs_sf %>%
+  as.data.frame() %>%
+  select(-geometry) %>%
+  select(percent_poc_log, percent_degrees_log, percent_renters_log, median_income_log, fs_pct_2020_log) %>%
+  pivot_longer(cols = c('percent_poc_log', 'percent_degrees_log', 'percent_renters_log', 'median_income_log')) %>%
+  ggplot(aes(x = value, y = fs_pct_2020_log)) +
+  geom_point() +
+  facet_wrap(~name, scales = "free") +
+  stat_smooth(method = 'lm') +
+  theme_few() +
+  scale_y_continuous(breaks=c(1.609438, 2.302585, 3.218876,4.317488), labels=c(5, 10, 25, 75)) +
+  labs(x = "Percent or median income (log transformed)",
+       y = 'Percent of Properties at Flood Risk (log transformed)')
+```
+
+## Pueblo
+```{r, include=TRUE, warning=FALSE}
+pueblo_sf %>%
+  as.data.frame() %>%
+  select(-geometry) %>%
+  select(percent_poc_log, percent_degrees_log, percent_renters_log, median_income_log, fs_pct_2020_log) %>%
+  pivot_longer(cols = c('percent_poc_log', 'percent_degrees_log', 'percent_renters_log', 'median_income_log')) %>%
+  ggplot(aes(x = value, y = fs_pct_2020_log)) +
+  geom_point() +
+  facet_wrap(~name, scales = "free") +
+  stat_smooth(method = 'lm') +
+  theme_few() +
+  scale_y_continuous(breaks=c(1.609438, 2.302585, 3.218876,4.317488), labels=c(5, 10, 25, 75)) +
+  labs(x = "Percent or median income (log transformed)",
+       y = 'Percent of Properties at Flood Risk (log transformed)')
+```
+
+## Front Range
+```{r, include=TRUE, warning=FALSE}
+flood_sf %>%
+  as.data.frame() %>%
+  select(-geometry) %>%
+  select(percent_poc_log, percent_degrees_log, percent_renters_log, median_income_log, fs_pct_2020_log) %>%
+  pivot_longer(cols = c('percent_poc_log', 'percent_degrees_log', 'percent_renters_log', 'median_income_log')) %>%
+  ggplot(aes(x = value, y = fs_pct_2020_log)) +
+  geom_point() +
+  facet_wrap(~name, scales = "free") +
+  stat_smooth(method = 'lm') +
+  theme_few() +
+  scale_y_continuous(breaks=c(1.609438, 2.302585, 3.218876,4.317488), labels=c(5, 10, 25, 75)) +
+  labs(x = "Percent or median income (log transformed)",
+       y = 'Percent of Properties at Flood Risk (log transformed)')
+```
+
+
+

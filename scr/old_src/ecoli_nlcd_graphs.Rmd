@@ -1,0 +1,757 @@
+---
+title: "graphs"
+author: "Spencer Rhea"
+date: "5/31/2020"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(raster)
+library(feather)
+library(tidyverse)
+library(stringr)
+library(viridis)
+library(sf)
+library(FedData)
+library(mapview)
+library(lubridate)
+library(feather)
+library(tidycensus)
+library(USAboundaries)
+library(ggthemes)
+library(ggplot2)
+library(kableExtra)
+library(knitr)
+library(tmap)
+library(tmaptools)
+library(RColorBrewer)
+library(nhdplusTools)
+```
+
+
+# Load and download data
+## NHD
+```{r, eval=FALSE}
+#co_extent <- extent(us_states(states = "CO"))
+
+#co_bbox <- bbox(co_extent)
+
+#subset_nhdplus(
+#comids = NULL,
+#output_file = "data/nhd/NHDPlus/download.gpkg",
+#nhdplus_data = "download",
+#bbox = co_bbox,
+#simplified = FALSE,
+#overwrite = FALSE,
+#return_data = TRUE,
+#status = TRUE
+#)
+
+nhd <- st_read('/Users/spencerrhea/Google Drive/EJ_paper /data/nhd/NHDPlus/download.gpkg', "NHDFlowline_Network")
+
+nhd_bodies <- st_read('/Users/spencerrhea/Google Drive/EJ_paper /data/nhd/NHDPlus/download.gpkg', "NHDWaterbody")
+```
+
+## E.coli data 
+```{r, eval=FALSE}
+# Read in raw e.coli data
+ecoli_raw <- read_feather("/Users/spencerrhea/Google Drive/EJ_paper /data/wq_data/Colorado_ecoli.feather")
+
+# Read in inventory
+inv <- read_feather('/Users/spencerrhea/Google Drive/EJ_paper /data/wq_data/test/wqp_inv.feather') %>%
+    select(SiteID=MonitoringLocationIdentifier,
+           resultCount,
+           parameter,
+                  lat,
+                  lon) %>%
+  distinct() %>%
+  filter(!is.na(lat),
+         !is.na(lon)) %>%
+  st_as_sf(.,coords=c('lon','lat'),crs=4326) %>%
+  distinct(SiteID)
+
+# clean e.coli data
+clean_ecoli <-  ecoli_raw %>%
+                  dplyr::select(date=ActivityStartDate,
+                         parameter=CharacteristicName,
+                         units=ResultMeasure.MeasureUnitCode,
+                         SiteID=MonitoringLocationIdentifier,
+                         org=OrganizationFormalName,
+                         org_id=OrganizationIdentifier,
+                         time=ActivityStartTime.Time,
+                         raw_value=ResultMeasureValue,
+                         sample_method=SampleCollectionMethod.MethodName,
+                         analytical_method=ResultAnalyticalMethod.MethodName,
+                         particle_size=ResultParticleSizeBasisText,
+                         date_time=ActivityStartDateTime,
+                         media=ActivityMediaName,
+                         sample_depth=ActivityDepthHeightMeasure.MeasureValue,
+                         sample_depth_unit=ActivityDepthHeightMeasure.MeasureUnitCode,
+                         fraction=ResultSampleFractionText,
+                         status=ResultStatusIdentifier) %>%
+  mutate(units = trimws(units)) %>%
+  #Keep only samples that are water samples
+  filter(media=='Water') %>%
+  filter(units != "ug/l")
+
+# Removed filter for log mean 
+ecoli_mean <- clean_ecoli %>%
+  filter(year(date) >= 2005 & year(date) <= 2015) %>%
+  filter(parameter == "Escherichia coli") %>%
+  group_by(SiteID) %>%
+  summarize(mean = mean(raw_value,na.rm=T) %>% round(.,2),
+            raw_mean = mean(raw_value,na.rm=T),
+            sd = sd(raw_value, na.rm = T),
+            count=n()) %>%
+  filter(count > 9) %>% 
+  #filter(sd < 5) %>%
+  mutate(log_mean=log10(mean)) %>%
+  filter(log_mean > 0.0000001)
+
+ecoli_mean_sf <- inv %>%
+  right_join(.,ecoli_mean,by='SiteID') %>%
+  st_transform(2163) 
+
+ecoli_mean_sf_100m <- ecoli_mean_sf %>%
+  st_buffer(100)
+
+ecoli_3km <- ecoli_mean_sf %>%
+  st_buffer(3000)
+```
+
+
+## WWTP 
+```{r, eval=FALSE}
+#Read in data from EPA's facility registration service, downloaded from EPA website 
+wastewater <- st_read(dsn = "/Users/spencerrhea/Google Drive/EJ_paper /data/wastewater/CWA_summaries_060314.gdb") %>%
+  filter(CWP_STATE == "CO")
+
+
+waste_water_full <- wastewater %>%
+  st_as_sf(coords = c("coords.x1", "coords.x2"), crs = "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +no_defs") %>%
+  filter(CWP_STATE == "CO") 
+
+#filter to only WWTP and remove permits that are no longer active
+sewage <- waste_water_full %>%
+  filter(SIC_CODES == 4952) %>%
+  filter(CWP_PERMIT_STATUS_DESC != "Terminated") %>%
+  mutate(type = "plant") %>%
+  filter(CWP_PERMIT_STATUS_DESC != "Expired") %>%
+  st_transform(2163) 
+
+#Flow 
+
+
+#wwtp_flow <- read_csv("/Users/spencerrhea/Google Drive/EJ_paper /data/wwtp_flow.csv") 
+
+#wwtp_flow <- wwtp_flow %>%
+#  filter(State == "CO")
+
+#wwtp_loc <- read_rds("/Users/spencerrhea/Google Drive/EJ_paper /data/sewage_plants.rds")
+```
+
+## Landcover 
+```{r, eval=FALSE}
+#Read in landcover database 
+nlcd <- raster("/Users/spencerrhea/Google Drive/EJ_paper /data/nlcd/NLCD_2016.img") 
+
+#get colorado shape 
+co <- us_states(states = "CO") %>%
+  st_transform(5070)
+
+#crop nlcd to colorado
+nlcd_co <- crop(nlcd, co)
+
+nlcd_object <- nlcd_co
+
+#get legend for nlcd codes 
+codes <- nlcd_co@data@attributes[[1]][["NLCD.Land.Cover.Class"]]
+
+legend <- as_data_frame(codes) %>%
+  mutate(id = row_number()) %>%
+  rename(type = value)  %>%
+  mutate(land = ifelse(type == "", NA, type)) %>%
+  filter(!is.na(land)) %>%
+  select(-land) %>%
+  mutate(type = as.character(type)) %>%
+  mutate(id = id-1)
+```
+
+## Census data
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+#Table to find census parameters of interest 
+v12 <- load_variables(2013, "acs5", cache = TRUE)
+
+front_range_co <- c("Adams", "Arapahoe", "Broomfield", "Clear Creek", "Douglas", "El Paso", "Elbert", "Fremont", "Gilpin", "Jefferson", "Larimer", "Park", "Pueblo", "Teller", "Denver")
+
+codes <- c(population = "B01003_001",
+           median_income = "B19013_001",
+           gini_index = "B19083_001",
+           median_age = "B01002_001",
+           education_25_total = "B15003_001",
+           hs_diploma = "B15003_017",
+           GED = "B15003_018",
+           some_college_1year = "B15003_019",
+           some_college = "B15003_020",
+           associates = "B15003_021",
+           bachelors = "B15003_022",
+           masters = "B15003_023",
+           professional = "B15003_024",
+           doctoral = "B15003_025",
+           tenure_total = "B25003_001",
+           renters = "B25003_003",
+           owners = "B25003_002",
+           sex_total = "B01001_001",
+           male = "B01001_002",
+           female = "B01001_026",
+           race_total = "B03002_001",
+           white = "B03002_003",
+           black = "B03002_004",
+           native = "B03002_005",
+           asian = "B03002_006",
+           hawaiian = "B03002_007",
+           other = "B03002_008",
+           two_or_more = "B03002_009",
+           hispanic = "B03002_012")
+
+#Download block group geometries from tidycensus package 
+block_group_geom <- get_acs(geography = "block group", variables = "B01003_001", year = 2013, state = "CO", county = front_range_co, geometry = T) %>%
+  select(GEOID, geometry)
+
+#Download block group census data
+block_group_census <- get_acs(geography = "block group", codes, year = 2013, state = "CO", county = front_range_co, geometry = F) 
+
+#Convert census data into wide table and calculate parameters of interest 
+bg_wide <- block_group_census %>%
+  pivot_wider(names_from = c("variable"), values_from = c("estimate", "moe")) %>%
+  mutate(color = estimate_black+estimate_native+estimate_asian+estimate_hawaiian+estimate_other+estimate_two_or_more+estimate_hispanic,
+         degrees = estimate_associates+estimate_bachelors+estimate_masters+estimate_professional+estimate_doctoral) %>%
+  rename(renters = estimate_renters,
+         female = estimate_female,
+         population = estimate_population,
+         renters = estimate_renters,
+         tenure_total = estimate_tenure_total,
+         education_25_total = estimate_education_25_total,
+         median_income = estimate_median_income,
+         median_age = estimate_median_age)
+
+#Join data with geometries
+bg_wide_geom <- inner_join(block_group_geom, bg_wide, by = "GEOID") %>%
+  st_transform(2163)
+
+#write_rds(bg_wide_geom, "data/census_fr.rds")
+```
+
+
+# Data Avilible 
+### Only front range counties 
+```{r, eval=FALSE}
+fr_census <- read_rds("/Users/spencerrhea/Google Drive/EJ_paper /data/census_fr.rds")
+
+nhd_order <- nhd %>%
+  st_transform(2163) %>%
+  filter(streamorde > 2) 
+
+nhd_bodies_trans <- nhd_bodies %>%
+  filter(ftype != "Ice Mass") %>%
+  st_transform(2163)
+
+#Gen number of river segments in block group
+data_avail <- fr_census %>%
+  st_buffer(3000) %>%
+  st_join(nhd_order) %>%
+  group_by(GEOID) %>%
+  summarise(num = n(),
+            length = sum(lengthkm, na.rm = T)) %>%
+  mutate(num = ifelse(length <= 0.001, 0, num))
+
+#number of lakes near block groups 
+data_bodies <- fr_census %>%
+  st_buffer(3000) %>%
+  st_join(nhd_bodies_trans) %>%
+  group_by(GEOID) %>%
+  summarise(lakes = n(),
+            area = sum(areasqkm, na.rm = T)) %>%
+  mutate(lakes = ifelse(area <= 0.0001, 0, lakes))
+
+#combine lakes and streams 
+data_full <- data_avail %>%
+  as.data.frame() %>%
+  select(-geometry) %>%
+  full_join(as.data.frame(data_bodies), by = "GEOID") %>%
+  select(-geometry) %>%
+  mutate(water = ifelse(lakes == 0 & num == 0, "non", "yes"))
+
+#join nhd to census 
+ecoli_avail <- st_join(fr_census, ecoli_3km) %>%
+  mutate(data_avail = ifelse(!is.na(mean),'has_data','no_data')) %>%
+  mutate(data_avail = as.factor(data_avail)) %>%
+  as.data.frame() %>%
+  select(-geometry)
+
+ecoli_water <- full_join(data_full, ecoli_avail, by = "GEOID") %>%
+  mutate(percent_color = color/population,
+         percent_renters = renters/tenure_total,
+         percent_degrees = degrees/education_25_total) 
+
+#write_rds(ecoli_water, "data_out/data_avail.rds")
+
+ecoli_water_graphe <- ecoli_water %>%
+  select(water, POC=percent_color, renters=percent_renters, degrees=percent_degrees, income=median_income, water) %>%
+  pivot_longer(cols = c(POC, renters, degrees, income))
+```
+
+## Lives within 3 km of a waterbody 
+```{r, eval=FALSE}
+ggplot(ecoli_water_graphe, aes(x = water, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~name, scales = "free") +
+  labs(x = "3km within a waterbody", y = "Proportion people of color")
+```
+
+## Of areas within 3 km of a waterbody, ecoli availability 
+```{r, eval=F}
+ecoli_water_sub <- ecoli_water %>%
+  filter(water == "yes") %>%
+  select(data_avail, POC=percent_color, renters=percent_renters, degrees=percent_degrees, income=median_income, water) %>%
+  pivot_longer(cols = c(POC, renters, degrees, income))
+
+ggplot(ecoli_water_sub, aes(x = data_avail, y = value)) +geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~name, scales = "free") +
+  labs(x = "E.coli data availability", y = "Proportion people of color")
+```
+
+# Function 
+### Downloads each river network and gets the percent of landcover at each river segment on the main stem. Also finds location of WWTP on the main stem. 
+```{r, eval=FALSE}
+#This function joins all sub basins in a basin to the nlcd and gets the number of pixles for all catagories 
+define_land_by_catch <- function(catch, row) {
+
+#transform to the nlcd crs 
+whole_catch <- catch[row,] %>%
+  st_transform(5070)
+
+#pull the basin codes
+fetid <- pull(whole_catch, featureid)
+
+#get etent of basin
+catch_extent <- extent(whole_catch)
+
+#crops nlcd to basin 
+nlcd_crop <- crop(nlcd_object, catch_extent) 
+
+nlcd_mask <- mask(nlcd_crop, whole_catch) 
+
+nlcd_trim <- trim(nlcd_mask) 
+
+#gets the numver of pixles in sub basin 
+values <- as.data.frame(getValues(nlcd_trim)) %>%
+  rename(id = 1) %>%
+  group_by(id) %>%
+  summarise(num = n()) %>%
+  filter(id != 0) %>%
+  full_join(legend) %>%
+  filter(!is.na(id))%>%
+  mutate(featureid = fetid) %>%
+  select(-id) 
+
+#Gets the total number of pixles in a basin
+total <- sum(values$num, na.rm = T)
+
+#pivot the table to wide
+fin <- values %>%
+  pivot_wider(names_from = type, values_from = num) %>%
+  mutate(Total = total)
+}
+
+
+
+#This function calculates the percent of landocover for all stream segmants on the main stem of the river 
+percecnt_along <- function(river_comid, flow_lines = flowline, watersheds = landcover_by_catchment) {
+
+#gets all sub basins that contribute to a river segmant 
+up_stream <- get_UT(flow_lines, river_comid)
+
+#filter flowlines to only ones contributing to a point on the main stem 
+up_segments <- flow_lines %>%
+  filter(comid %in% up_stream)
+
+#filter catchment to only the basin contributing to a point on the main stem 
+catch <- watersheds %>%
+  filter(featureid %in% pull(up_segments, comid)) %>%
+  pivot_longer(cols = c("Evergreen Forest", "Shrub/Scrub", "Unclassified", "Open Water", "Perennial Snow/Ice", "Developed, Open Space", "Developed, Low Intensity", "Developed, Medium Intensity", "Developed, High Intensity", "Barren Land", "Deciduous Forest", "Mixed Forest", "Herbaceuous", "Hay/Pasture", "Cultivated Crops", "Woody Wetlands", "Emergent Herbaceuous Wetlands")) %>%
+  group_by(name) %>%
+  summarise(num = sum(value, na.rm = T)) %>%
+  mutate(num = as.numeric(num)) 
+
+#gets total number of pixles for each catchment 
+total <- sum(catch$num) 
+
+#gets percent of landcover for each catchment 
+final <- catch %>%
+  mutate(Total = total) %>%
+  mutate(percent = (num/Total)*100) %>%
+  mutate(percent = round(percent, 5)) %>%
+  select(name, percent) %>%
+  mutate(comid = river_comid) %>%
+  pivot_wider(names_from = name, values_from = percent)
+}
+
+
+
+#This function return the landcover percentages for all subasins 
+river_longitudinal <- function(lat, long) {
+
+start <- st_sfc(st_point(c(long, lat)), crs = 4269)
+
+#Gets river segment of where the point is 
+start_comid <- discover_nhdplus_id(start)
+
+#get flowlines for river network
+river_flowline <- navigate_nldi(list(featureSource = "comid", 
+                               featureID = start_comid), 
+                          mode = "upstreamTributaries", 
+                          data_source = "")
+
+#get catchments, waterbodies, and flowline 
+river_subset <- subset_nhdplus(comids = river_flowline$nhdplus_comid,
+                         output_file = "data/nhd/subset.gpkg",
+                         nhdplus_data = "download", 
+                         return_data = TRUE, 
+                         overwrite = T)
+
+#Pull out all dataframes 
+river_flowline <- river_subset$NHDFlowline_Network
+river_catchment <- river_subset$CatchmentSP
+river_waterbody <- river_subset$NHDWaterbody
+
+#prep dataframe for nhdpulstools 
+river_prep <- prepare_nhdplus(river_flowline, min_network_size = 10, min_path_length = 10) %>%
+  select(ID = COMID, toID = toCOMID, length = LENGTHKM)
+
+#get the mainstem flowline codes
+river_main <- get_UM(river_flowline, start_comid)
+
+#get dataframe with only mainstem 
+river <- river_flowline %>%
+  filter(comid %in% river_main)
+
+#Get pathlength of river segments 
+river_pathlength <- get_pathlength(river_prep)
+
+#join pathlengths with dataframe 
+river_length <- river_flowline %>%
+  rename(ID = comid) %>%
+  right_join(river_pathlength, by = "ID")
+
+#join mainstem to pethlengths 
+riv <- river_length %>%
+  filter(ID %in% river_main) %>%
+  st_transform(4269) %>%
+  select(-pathlength.x) %>%
+  rename(pathlength = pathlength.y)
+
+#add id column 
+river_catchment_id <- river_catchment %>%
+  mutate(row = row_number())
+
+whole_catch <- river_catchment_id
+
+# Us function to get landcover for all catchments 
+river_landcover_by_catchment <- define_land_by_catch(river_catchment_id, 1)
+
+land_length <- as.numeric(length(river_catchment_id$id))
+
+seqens <- 1:(land_length-1)
+for(i in seqens) {
+  x <- i+1
+  shed <- define_land_by_catch(river_catchment_id, x)
+  
+  river_landcover_by_catchment <- rbind(river_landcover_by_catchment, shed)
+}
+
+landcover_by_catchment <- river_landcover_by_catchment
+
+flowline <- river_flowline
+
+#get percentage for all river segments on the mainstem 
+river_comids <- pull(riv, ID)
+
+river_percents <- percecnt_along(river_comids[1], flowline, landcover_by_catchment)
+
+comids_length <- as.numeric(length(river_comids)[1])
+
+seq <- 1:(comids_length-1)
+for(i in seq) {
+  new <- percecnt_along(river_comids[i+1], flowline, landcover_by_catchment) 
+  
+  river_percents <- rbind(new, river_percents)
+}
+
+#define all landcover types 
+
+river_percent_along_river <- river_percents %>%
+  rename(barren = 2,
+         crops = 3,
+         deciduous = 4,
+         developed_high = 5,
+         developed_low = 6,
+         developed_mid = 7,
+         developed_open = 8,
+         wetland_herbaceous = 9,
+         evergreen = 10,
+         hay_pasture = 11,
+         herbaceous = 12,
+         forest_mixed = 13,
+         water = 14,
+         ice = 15,
+         shrub = 16,
+         wetland_wood = 18) %>%
+  select(-Unclassified)
+
+
+#summarise landcover types 
+river_landcover_sumz <- river_percent_along_river %>%
+  mutate(developed = developed_high+developed_low+developed_mid+developed_open,
+         forest = forest_mixed+deciduous+evergreen,
+         wetland = wetland_herbaceous+wetland_wood,
+         agriculture = crops+hay_pasture) %>%
+  select(-developed_high, -developed_mid, -developed_low, -forest_mixed, -deciduous, -evergreen, -wetland_herbaceous, -wetland_wood, -crops, -hay_pasture, -developed_open) 
+
+#get laength of river 
+max_length <- max(riv$pathlength)
+
+#change length so the outlet is the largest number 
+riv_trans <- riv %>%
+  mutate(pathlength = max_length-pathlength) %>%
+  rename(comid = ID) %>%
+  st_transform(2163) 
+
+#buffer sewage to join to river 
+wwtp_buff <- sewage %>%
+  st_buffer(300)
+
+#get all wwtp on the river 
+river_wwtp <- st_join(riv_trans, wwtp_buff) %>%
+  filter(!is.na(CWP_NAME))
+
+#get only codes 
+river_sweage_codes <- river_wwtp %>%
+  group_by(REGISTRY_ID) %>%
+  summarise(length = mean(pathlength, na.rm = T)) %>%
+  pull(length)
+
+river_sweage_id <- river_wwtp %>%
+  group_by(REGISTRY_ID) %>%
+  summarise(length = mean(pathlength, na.rm = T)) %>%
+  pull(REGISTRY_ID)
+
+river_sweage_names <- river_wwtp %>%
+  filter(REGISTRY_ID %in% river_sweage_id) %>%
+  pull(CWP_NAME)
+
+#join ecoli points to rivers
+riv_jumps <- st_join(riv_trans, ecoli_mean_sf_100m)
+
+#make dataframe with landcover and ecoli points 
+riv_jumps_fil <- riv_jumps %>%
+  as.data.frame() %>%
+  full_join(river_landcover_sumz, by = "comid") %>%
+  select(-geometry) %>%
+  filter(!is.na(pathlength)) %>%
+  select(pathlength, mean, herbaceous, shrub, developed, forest, wetland, agriculture) %>%
+  mutate(mean = mean/50) %>%
+   pivot_longer(cols = c(herbaceous, shrub, developed, forest, wetland, agriculture))
+
+#make a list with both landcover dataframe and wwtp locations 
+fin <- list(full = riv_jumps_fil,
+     wwtp = river_sweage_codes,
+     wwtp_names = river_sweage_names,
+     nlcd_raw = river_percent_along_river,
+     flowlines = river_flowline, 
+     catchment = river_catchment,
+     waterbodies = river_waterbody, 
+     mainstem = riv)
+
+return(fin)
+
+}
+```
+
+# Stream Jumps 
+### Vertical lines represent WWTP, some lines close together are probably a double count 
+## Poudre 
+```{r, warning=FALSE}
+# poudre_test <- river_longitudinal(lat = 40.423795, long = -104.600462)
+# 
+# write_rds(poudre_test, "data_out/poudre.rds")
+
+poudre <- read_rds("/Volumes/Spencer backup/Google Drive/EJ_paper /data_out/poudre.rds")
+
+ggplot(poudre[["full"]], aes(x = pathlength, y = value, colour = name)) +
+  geom_vline(xintercept = poudre[["wwtp"]], color = "gray") +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+```
+
+## Big Thompson 
+```{r, warning=FALSE, echo=FALSE}
+# bt_full <- river_longitudinal(40.354054, -104.761314)
+# 
+# write_rds(bt_full, "data_out/big_thompson.rds")
+
+bt_full <- read_rds("/Volumes/Spencer backup/Google Drive/EJ_paper /data_out/big_thompson.rds")
+
+ggplot(bt_full[["full"]], aes(x = pathlength, y = value, colour = name)) +
+  geom_vline(xintercept = bt_full[["wwtp"]], color = "gray") +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+```
+
+## St. Vrain 
+```{r, warning=FALSE, echo=FALSE}
+# st_vrain <- river_longitudinal(40.270375, -104.874370)
+# 
+# write_rds(st_vrain, "data_out/st_vrain.rds")
+
+st_vrain <- read_rds("/Volumes/Spencer backup/Google Drive/EJ_paper /data_out/st_vrain.rds")
+
+ggplot(st_vrain[["full"]], aes(x = pathlength, y = value, colour = name)) +
+  geom_vline(xintercept = st_vrain[["wwtp"]], color = "gray") +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+```
+
+## Boulder Creek 
+```{r, warning=FALSE, echo=FALSE}
+# boulder_creek <- river_longitudinal(40.157845, -105.009788)
+# 
+# write_rds(boulder_creek, "data_out/boulder_creek.rds")
+
+boulder_creek <- read_rds("/Volumes/Spencer backup/Google Drive/EJ_paper /data_out/boulder_creek.rds")
+
+ggplot(boulder_creek[["full"]], aes(x = pathlength, y = value, colour = name)) +
+  geom_vline(xintercept = boulder_creek[["wwtp"]], color = "gray") +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+```
+
+
+## South Platte 
+```{r, warning=FALSE, echo=FALSE}
+# south_platte <- river_longitudinal(40.629481, -103.181869)
+# 
+# write_rds(south_platte, "data_out/south_platte.rds")
+
+south_platte <- read_rds("/Volumes/Spencer backup/Google Drive/EJ_paper /data_out/south_platte.rds")
+
+sp_sweage_codes <- c(281.122, 281.122, 188.124, 188.124, 178.222, 178.222, 178.222, 178.222, 178.222, 178.222, 157.964, 157.964, 157.964, 157.964, 157.964, 157.964)
+
+ggplot(south_platte, aes(x = pathlength, y = value, colour = name)) +
+  geom_vline(xintercept = sp_sweage_codes, color = "gray") +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+```
+
+## Monument Creek 
+```{r, warning=FALSE, echo=FALSE}
+# monument_creek <- river_longitudinal(38.832856, -104.831865)
+# 
+# write_rds(monument_creek, "data_out/monument_creek.rds")
+
+monument_creek <- read_rds("/Volumes/Spencer backup/Google Drive/EJ_paper /data_out/monument_creek.rds")
+
+ggplot(monument_creek[["full"]], aes(x = pathlength, y = value, colour = name)) +
+  geom_vline(xintercept = monument_creek[["wwtp"]], color = "gray") +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+```
+
+
+## Fountain Creek
+```{r, warning=FALSE, echo=FALSE}
+# fountain_full <- river_longitudinal(38.254237, -104.589736)
+# 
+# write_rds(fountain_full, "data_out/fountain.rds")
+
+fountain_full <- read_rds("/Volumes/Spencer backup/Google Drive/EJ_paper /data_out/fountain.rds")
+
+ggplot(fountain_full[["full"]], aes(x = pathlength, y = value, colour = name)) +
+  geom_vline(xintercept = fountain_full[["wwtp"]], color = "gray") +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+```
+
+
+## Arkansas 
+```{r, warning=FALSE, echo=FALSE}
+# arkansas <- river_longitudinal(38.081337, -103.232209)
+# 
+# write_rds(arkansas, "data_out/arkansas.rds")
+
+arkansas_full <- read_rds("/Volumes/Spencer backup/Google Drive/EJ_paper /data_out/arkansas.rds")
+
+ggplot(arkansas_full[["full"]], aes(x = pathlength, y = value, colour = name)) +
+  geom_vline(xintercept = arkansas_full[["wwtp"]], color = "gray") +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+```
+
+

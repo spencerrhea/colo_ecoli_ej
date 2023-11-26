@@ -1,0 +1,274 @@
+---
+title: "Metro Area Dummy Variable"
+author: "Spencer Rhea"
+date: "2/8/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(raster)
+library(feather)
+library(tidyverse)
+library(stringr)
+library(ggpubr)
+library(viridis)
+library(sf)
+library(FedData)
+library(mapview)
+library(lubridate)
+library(feather)
+library(tidycensus)
+library(USAboundaries)
+library(ggthemes)
+library(ggplot2)
+library(kableExtra)
+library(knitr)
+library(tmap)
+library(tmaptools)
+library(RColorBrewer)
+library(nhdplusTools)
+library(glue)
+```
+
+```{r, echo=FALSE, include=FALSE}
+
+## Load and prep ecoli data ####
+# Read in raw e.coli data
+ecoli_raw <- read_feather('/Users/spencerrhea/Desktop/EJ_paper /data_final/ecoli/Colorado_ecoli.feather')
+
+# Read in inventory
+inv <- read_feather('/Users/spencerrhea/Desktop/EJ_paper /data_final/ecoli/wqp_inv.feather') %>%
+    select(SiteID=MonitoringLocationIdentifier,
+           resultCount,
+           parameter,
+           lat,
+           lon) %>%
+    distinct() %>%
+    filter(!is.na(lat),
+           !is.na(lon)) %>%
+    st_as_sf(.,coords=c('lon','lat'),crs=4326) %>%
+    distinct(SiteID)
+
+# clean e.coli data
+clean_ecoli <-  ecoli_raw %>%
+    dplyr::select(date=ActivityStartDate,
+                  parameter=CharacteristicName,
+                  units=ResultMeasure.MeasureUnitCode,
+                  SiteID=MonitoringLocationIdentifier,
+                  org=OrganizationFormalName,
+                  org_id=OrganizationIdentifier,
+                  time=ActivityStartTime.Time,
+                  raw_value=ResultMeasureValue,
+                  sample_method=SampleCollectionMethod.MethodName,
+                  analytical_method=ResultAnalyticalMethod.MethodName,
+                  particle_size=ResultParticleSizeBasisText,
+                  date_time=ActivityStartDateTime,
+                  media=ActivityMediaName,
+                  sample_depth=ActivityDepthHeightMeasure.MeasureValue,
+                  sample_depth_unit=ActivityDepthHeightMeasure.MeasureUnitCode,
+                  fraction=ResultSampleFractionText,
+                  status=ResultStatusIdentifier) %>%
+    mutate(units = trimws(units)) %>%
+    #Keep only samples that are water samples
+    filter(media=='Water') %>%
+    filter(units != "ug/l")
+
+# Removed filter for log mean 
+ecoli_mean <- clean_ecoli %>%
+    filter(year(date) >= 2005 & year(date) <= 2015) %>%
+    filter(parameter == "Escherichia coli") %>%
+    group_by(SiteID) %>%
+    summarize(mean = mean(raw_value,na.rm=T) %>% round(.,2),
+              raw_mean = mean(raw_value,na.rm=T),
+              sd = sd(raw_value, na.rm = T),
+              count=n()) %>%
+    filter(count > 9) %>% 
+    #filter(sd < 5) %>%
+    mutate(log_mean=log10(mean)) %>%
+    filter(log_mean > 0.0000001)
+
+ecoli_mean_sf <- inv %>%
+    right_join(.,ecoli_mean,by='SiteID') %>%
+    st_transform(2163) 
+
+
+
+## Load NHD flowlines #### 
+nhd <- st_read('/Users/spencerrhea/Desktop/EJ_paper /data_final/nhd/nhd_sf.gpkg', "NHDFlowline_Network")
+
+nhd_order <- nhd %>%
+    st_transform(2163) %>%
+    filter(streamorde > 2) 
+
+
+#remove sites not on river #### 
+river_ecoli <- nhd_order %>%
+    st_buffer(100) %>%
+    st_join(ecoli_mean_sf)
+
+#Filter sites not in the front range ####
+
+census_data <- list.files('/Users/spencerrhea/Desktop/EJ_paper /data_final/census', full.names = TRUE)
+front_range_whole <- tibble()
+for(i in 1:length(census_data)) {
+    metro_area <-  read_rds(census_data[i])
+    
+    front_range_whole <- rbind(front_range_whole, metro_area)
+}
+
+front_range_footprint <- st_union(front_range_whole)
+
+river_ecoli_sites <- ecoli_mean_sf %>%
+    filter(SiteID %in% !!unique(river_ecoli$SiteID))
+
+fr_ecoli <- st_filter(st_transform(river_ecoli_sites, 4269), 
+                      front_range_footprint) %>%
+    st_transform(2163) %>%
+    st_buffer(3000)
+
+# fr_ecoli %>%
+#     filter(mean >= 1556.38) %>% 
+#     mapview()
+
+
+
+## Ecoli linear models ####
+
+census_ecoli <- function(metro_area) {
+    
+    if(metro_area == 'global') {
+        fils <- list.files('/Users/spencerrhea/Desktop/EJ_paper /data_final/census/', full.names = T)
+        
+        census_raw <- tibble()
+        for(i in 1:length(fils)) {
+            site <- read_rds(fils[i])
+            census_raw <- rbind(census_raw, site)
+        }
+    } else {
+        
+        metro_path <- glue('/Users/spencerrhea/Desktop/EJ_paper /data_final/census/{m}.rds',
+                           m = metro_area)
+        
+        census_raw <- read_rds(metro_path) 
+    }
+    
+    census_raw <- st_transform(census_raw, 2163)
+    
+    colorado_3km_ecoli <- st_join(census_raw, fr_ecoli)
+    
+    #Removing sites where there is overlap
+    grouped_3km <- colorado_3km_ecoli %>%
+        filter(!is.na(SiteID)) %>%
+        mutate(weighted_income = median_income*population) %>%
+        mutate(weighted_mean = mean*count) %>%
+        group_by(SiteID) %>%
+        summarise(color = sum(color, na.rm = T),
+                  mean = mean(mean, na.rm = T),
+                  weighted_mean = mean(weighted_mean, na.rm = T),
+                  mean_n = mean(count, na.rm = T),
+                  total = sum(population, na.rm = T),
+                  percent_color = (color/total)*100,
+                  income = sum(weighted_income, na.rm = T)/sum(total),
+                  renters = sum(renters, na.rm = T),
+                  tenure_total = sum(tenure_total, na.rm = T),
+                  degrees = sum(degrees, na.rm = T),
+                  education = sum(education_25_total, na.rm = T),
+                  percent_renters = sum(renters, na.rm = T)/sum(tenure_total, na.rm = T),
+                  percent_degree = sum(degrees, na.rm = T)/sum(education_25_total, na.rm = T)) %>%
+        #Regroup by income
+        group_by(income) %>%
+        summarise(mean = sum(weighted_mean, na.rm = T)/sum(mean_n, na.rm = T),
+                  percent_color = sum(color)/sum(total)*100,
+                  percent_renters = sum(renters, na.rm = T)/sum(tenure_total, na.rm = T)*100,
+                  percent_degrees = sum(degrees, na.rm = T)/sum(education, na.rm = T)*100) 
+    
+    grouped_3km_lm <- grouped_3km %>%
+        mutate(log_color = log(percent_color+1),
+               log_renters = log(percent_renters+1),
+               log_degrees = log(percent_degrees+1),
+               log_mean = log(mean),
+               log_income = log(income)) %>%
+        select(log_mean, log_color, log_renters, log_degrees, log_income)
+    
+    return(grouped_3km_lm) 
+}
+
+census_ecoli_dummy <- function(metro_area) {
+    
+    if(metro_area == 'global') {
+        fils <- list.files('/Users/spencerrhea/Desktop/EJ_paper /data_final/census/', full.names = T)
+        
+        census_raw <- tibble()
+        for(i in 1:length(fils)) {
+            site <- read_rds(fils[i])
+            census_raw <- rbind(census_raw, site)
+        }
+    } else {
+        
+        metro_path <- glue('/Users/spencerrhea/Desktop/EJ_paper /data_final/census/{m}.rds',
+                           m = metro_area)
+        
+        census_raw <- read_rds(metro_path) 
+    }
+    
+    census_raw <- st_transform(census_raw, 2163)
+    
+    colorado_3km_ecoli <- st_join(census_raw, fr_ecoli)
+    
+    #Removing sites where there is overlap
+    grouped_3km <- colorado_3km_ecoli %>%
+        filter(!is.na(SiteID)) %>%
+        mutate(weighted_income = median_income*population) %>%
+        mutate(weighted_mean = mean*count) %>%
+        group_by(SiteID, metro_area) %>%
+        summarise(color = sum(color, na.rm = T),
+                  mean = mean(mean, na.rm = T),
+                  weighted_mean = mean(weighted_mean, na.rm = T),
+                  mean_n = mean(count, na.rm = T),
+                  total = sum(population, na.rm = T),
+                  percent_color = (color/total)*100,
+                  income = sum(weighted_income, na.rm = T)/sum(total),
+                  renters = sum(renters, na.rm = T),
+                  tenure_total = sum(tenure_total, na.rm = T),
+                  degrees = sum(degrees, na.rm = T),
+                  education = sum(education_25_total, na.rm = T),
+                  percent_renters = sum(renters, na.rm = T)/sum(tenure_total, na.rm = T),
+                  percent_degree = sum(degrees, na.rm = T)/sum(education_25_total, na.rm = T)) %>%
+        #Regroup by income
+        group_by(income, metro_area) %>%
+        summarise(mean = sum(weighted_mean, na.rm = T)/sum(mean_n, na.rm = T),
+                  percent_color = sum(color)/sum(total)*100,
+                  percent_renters = sum(renters, na.rm = T)/sum(tenure_total, na.rm = T)*100,
+                  percent_degrees = sum(degrees, na.rm = T)/sum(education, na.rm = T)*100) 
+    
+    grouped_3km_lm <- grouped_3km %>%
+        mutate(log_color = log(percent_color+1),
+               log_renters = log(percent_renters+1),
+               log_degrees = log(percent_degrees+1),
+               log_mean = log(mean),
+               log_income = log(income)) %>%
+        select(log_mean, log_color, log_renters, log_degrees, log_income, metro_area)
+    
+    return(grouped_3km_lm) 
+}
+
+gloabl_ecoli_census_metro <- census_ecoli_dummy(metro_area = 'global')
+gloabl_ecoli_census <- census_ecoli(metro_area = 'global')
+```
+
+## Original Global Model 
+```{r}
+summary(lm(log_mean ~ log_color+log_renters+log_income+log_degrees, gloabl_ecoli_census))
+```
+
+## With dummy variables for metro areas 
+```{r}
+gloabl_ecoli_census_metro$metro_area <- factor(gloabl_ecoli_census_metro$metro_area)
+
+summary(lm(log_mean ~ log_color+log_renters+log_income+log_degrees+metro_area, gloabl_ecoli_census_metro))
+
+```
+

@@ -1,0 +1,1179 @@
+---
+title: "ecoli_wwtp_lc"
+author: "Spencer Rhea"
+date: "5/31/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(raster)
+library(feather)
+library(nlc)
+library(tidyverse)
+library(stringr)
+library(viridis)
+library(sf)
+library(FedData)
+library(mapview)
+library(lubridate)
+library(feather)
+library(tidycensus)
+library(USAboundaries)
+library(ggthemes)
+library(ggplot2)
+library(kableExtra)
+library(knitr)
+library(tmap)
+library(tmaptools)
+library(ColorBrewer)
+library(RColorBrewer)
+library(nhdplusTools)
+```
+
+# Load and download data
+## NHD
+```{r}
+#co_extent <- extent(us_states(states = "CO"))
+
+#co_bbox <- bbox(co_extent)
+
+#subset_nhdplus(
+#comids = NULL,
+#output_file = "data/nhd/NHDPlus/download.gpkg",
+#nhdplus_data = "download",
+#bbox = co_bbox,
+#simplified = FALSE,
+#overwrite = FALSE,
+#return_data = TRUE,
+#status = TRUE
+#)
+
+nhd <- st_read('data/nhd/NHDPlus/download.gpkg', "NHDFlowline_Network")
+
+nhd_bodies <- st_read('data/nhd/NHDPlus/download.gpkg', "NHDWaterbody")
+```
+
+## WWTP 
+```{r}
+#Read in data from EPA's facility registration service, downloaded from EPA website 
+wastewater <- st_read(dsn = "data/wastewater/CWA_summaries_060314.gdb") %>%
+  filter(CWP_STATE == "CO")
+
+
+waste_water_full <- wastewater %>%
+  st_as_sf(coords = c("coords.x1", "coords.x2"), crs = "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +no_defs") %>%
+  filter(CWP_STATE == "CO") 
+
+#filter to only WWTP and remove permits that are no longer active
+sewage <- waste_water_full %>%
+  filter(SIC_CODES == 4952) %>%
+  filter(CWP_PERMIT_STATUS_DESC != "Terminated") %>%
+  mutate(type = "plant") %>%
+  filter(CWP_PERMIT_STATUS_DESC != "Expired") %>%
+  st_transform(2163) 
+
+
+#Flow 
+
+
+wwtp_flow <- read_csv("data/wwtp_flow.csv") 
+
+wwtp_flow <- wwtp_flow %>%
+  filter(State == "CO")
+
+wwtp_loc <- read_rds("data/sewage_plants.rds")
+```
+
+
+## E.coli data 
+```{r cars}
+ecoli_raw <- read_feather("data/wq_data/Colorado_ecoli.feather")
+
+inv <- read_feather('data/wq_data/test/wqp_inv.feather') %>%
+    select(SiteID=MonitoringLocationIdentifier,
+           resultCount,
+           parameter,
+                  lat,
+                  lon) %>%
+  distinct() %>%
+  filter(!is.na(lat),
+         !is.na(lon)) %>%
+  st_as_sf(.,coords=c('lon','lat'),crs=4326) %>%
+  distinct(SiteID)
+
+
+clean_ecoli <-  ecoli_raw %>%
+                  dplyr::select(date=ActivityStartDate,
+                         parameter=CharacteristicName,
+                         units=ResultMeasure.MeasureUnitCode,
+                         SiteID=MonitoringLocationIdentifier,
+                         org=OrganizationFormalName,
+                         org_id=OrganizationIdentifier,
+                         time=ActivityStartTime.Time,
+                         raw_value=ResultMeasureValue,
+                         sample_method=SampleCollectionMethod.MethodName,
+                         analytical_method=ResultAnalyticalMethod.MethodName,
+                         particle_size=ResultParticleSizeBasisText,
+                         date_time=ActivityStartDateTime,
+                         media=ActivityMediaName,
+                         sample_depth=ActivityDepthHeightMeasure.MeasureValue,
+                         sample_depth_unit=ActivityDepthHeightMeasure.MeasureUnitCode,
+                         fraction=ResultSampleFractionText,
+                         status=ResultStatusIdentifier) %>%
+  mutate(units = trimws(units)) %>%
+  #Keep only samples that are water samples
+  filter(media=='Water') %>%
+  filter(units != "ug/l")
+
+# Removed filter for log mean 
+ecoli_mean <- clean_ecoli %>%
+  filter(year(date) >= 2005 & year(date) <= 2015) %>%
+  filter(parameter == "Escherichia coli") %>%
+  group_by(SiteID) %>%
+  summarize(mean = mean(raw_value,na.rm=T) %>% round(.,2),
+            raw_mean = mean(raw_value,na.rm=T),
+            sd = sd(raw_value, na.rm = T),
+            count=n()) %>%
+  filter(count > 9) %>% 
+  #filter(sd < 5) %>%
+  mutate(log_mean=log10(mean)) %>%
+  filter(log_mean > 0.0000001)
+
+ecoli_mean_sf <- inv %>%
+  right_join(.,ecoli_mean,by='SiteID') %>%
+  st_transform(2163) 
+
+ecoli_mean_sf_100m <- ecoli_mean_sf %>%
+  st_buffer(100)
+
+ecoli_3km <- ecoli_mean_sf %>%
+  st_buffer(3000)
+```
+
+## Census data
+```{r}
+#Table to find census parameters of interest 
+v12 <- load_variables(2013, "acs5", cache = TRUE)
+
+front_range_co <- c("Adams", "Arapahoe", "Boulder", "Clear Creek", "Douglas", "El Paso", "Elbert", "Fremont", "Gilpin", "Jefferson", "Larimer", "Park", "Pueblo", "Teller", "Weld", "Denver")
+
+codes <- c(population = "B01003_001",
+           median_income = "B19013_001",
+           gini_index = "B19083_001",
+           median_age = "B01002_001",
+           education_25_total = "B15003_001",
+           hs_diploma = "B15003_017",
+           GED = "B15003_018",
+           some_college_1year = "B15003_019",
+           some_college = "B15003_020",
+           associates = "B15003_021",
+           bachelors = "B15003_022",
+           masters = "B15003_023",
+           professional = "B15003_024",
+           doctoral = "B15003_025",
+           tenure_total = "B25003_001",
+           renters = "B25003_003",
+           owners = "B25003_002",
+           sex_total = "B01001_001",
+           male = "B01001_002",
+           female = "B01001_026",
+           race_total = "B03002_001",
+           white = "B03002_003",
+           black = "B03002_004",
+           native = "B03002_005",
+           asian = "B03002_006",
+           hawaiian = "B03002_007",
+           other = "B03002_008",
+           two_or_more = "B03002_009",
+           hispanic = "B03002_012")
+
+#Download block group geometries from tidycensus package 
+block_group_geom <- get_acs(geography = "block group", variables = "B01003_001", year = 2013, state = "CO", county = front_range_co, geometry = T) %>%
+  select(GEOID, geometry)
+
+#Download block group census data
+block_group_census <- get_acs(geography = "block group", codes, year = 2013, state = "CO", county = front_range_co, geometry = F) 
+
+#Convert census data into wide table and calculate parameters of interest 
+bg_wide <- block_group_census %>%
+  pivot_wider(names_from = c("variable"), values_from = c("estimate", "moe")) %>%
+  mutate(color = estimate_black+estimate_native+estimate_asian+estimate_hawaiian+estimate_other+estimate_two_or_more+estimate_hispanic,
+         degrees = estimate_associates+estimate_bachelors+estimate_masters+estimate_professional+estimate_doctoral) %>%
+  rename(renters = estimate_renters,
+         female = estimate_female,
+         population = estimate_population,
+         renters = estimate_renters,
+         tenure_total = estimate_tenure_total,
+         education_25_total = estimate_education_25_total,
+         median_income = estimate_median_income,
+         median_age = estimate_median_age)
+
+#Join data with geometries
+bg_wide_geom <- inner_join(block_group_geom, bg_wide, by = "GEOID") %>%
+  st_transform(2163)
+
+#write_rds(bg_wide_geom, "data/census_fr.rds")
+
+fr_census <- read_rds("data/census_fr.rds")
+```
+
+
+# Data Avilible 
+```{r}
+nhd_order <- nhd %>%
+  st_transform(2163) %>%
+  filter(streamorde > 2) 
+
+nhd_bodies_trans <- nhd_bodies %>%
+  filter(ftype != "Ice Mass") %>%
+  st_transform(2163)
+
+#Gen number of river segments in block group
+data_avail <- fr_census %>%
+  st_buffer(3000) %>%
+  st_join(nhd_order) %>%
+  group_by(GEOID) %>%
+  summarise(num = n(),
+            length = sum(lengthkm, na.rm = T)) %>%
+  mutate(num = ifelse(length <= 0.001, 0, num))
+
+#number of lakes near block groups 
+data_bodies <- fr_census %>%
+  st_buffer(3000) %>%
+  st_join(nhd_bodies_trans) %>%
+  group_by(GEOID) %>%
+  summarise(lakes = n(),
+            area = sum(areasqkm, na.rm = T)) %>%
+  mutate(lakes = ifelse(area <= 0.0001, 0, lakes))
+
+#combine lakes and streams 
+data_full <- data_avail %>%
+  as.data.frame() %>%
+  select(-geometry) %>%
+  full_join(as.data.frame(data_bodies), by = "GEOID") %>%
+  select(-geometry) %>%
+  mutate(water = ifelse(lakes == 0 & num == 0, "non", "yes"))
+
+#join nhd to census 
+ecoli_avail <- st_join(fr_census, ecoli_3km) %>%
+  mutate(data_avail = ifelse(!is.na(mean),'has_data','no_data')) %>%
+  mutate(data_avail = as.factor(data_avail)) %>%
+  as.data.frame() %>%
+  select(-geometry)
+
+ecoli_water <- full_join(data_full, ecoli_avail, by = "GEOID") %>%
+  mutate(percent_color = color/population)
+```
+
+## Lives within 3 km of a waterbody 
+```{r}
+ggplot(ecoli_water, aes(x = water, y = percent_color)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  labs(x = "3km within a waterbody", y = "Proportion people of color")
+```
+
+## Of areas within 3 km of a waterbody 
+```{r}
+ecoli_water_sub <- ecoli_water %>%
+  filter(water == "yes") 
+
+ggplot(ecoli_water_sub, aes(x = data_avail, y = percent_color)) +geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  labs(x = "Data availability", y = "Proportion people of color")
+```
+
+# Landcover 
+```{r}
+nlcd <- raster("nlcd/NLCD_2016.img") 
+
+co <- us_states(states = "CO") %>%
+  st_transform(5070)
+
+nlcd_co <- crop(nlcd, co)
+
+codes <- nlcd_co@data@attributes[[1]][["NLCD.Land.Cover.Class"]]
+
+legend <- as_data_frame(codes) %>%
+  mutate(id = row_number()) %>%
+  rename(type = value)  %>%
+  mutate(land = ifelse(type == "", NA, type)) %>%
+  filter(!is.na(land)) %>%
+  select(-land) %>%
+  mutate(type = as.character(type)) %>%
+  mutate(id = id-1)
+```
+
+# South Platte 
+## nhd 
+```{r}
+sp_start <- st_sfc(st_point(c(-104.603644, 40.416362)), crs = 4269)
+sp_comid <- discover_nhdplus_id(sp_start)
+
+sp_flowline <- navigate_nldi(list(featureSource = "comid", 
+                               featureID = sp_comid), 
+                          mode = "upstreamTributaries", 
+                          data_source = "")
+
+
+sp_subset <- subset_nhdplus(comids = sp_flowline$nhdplus_comid,
+                         output_file = "nhd/subset.gpkg",
+                         nhdplus_data = "download", 
+                         return_data = TRUE, 
+                         overwrite = T)
+
+
+sp_flowline <- sp_subset$NHDFlowline_Network
+sp_catchment <- sp_subset$CatchmentSP
+sp_waterbody <- sp_subset$NHDWaterbody
+
+
+platte <- sp_flowline %>%
+  filter(gnis_name == "South Platte River")
+
+sp_prep <- prepare_nhdplus(sp_flowline, min_network_size = 10, min_path_length = 10) %>%
+  select(ID = COMID, toID = toCOMID, length = LENGTHKM)
+
+sp_pathlength <- get_pathlength(sp_prep)
+
+sp_length <- sp_flowline %>%
+  rename(ID = comid) %>%
+  right_join(sp_pathlength, by = "ID")
+
+platte <- sp_length %>%
+  filter(gnis_name == "South Platte River") %>%
+  st_transform(4269) %>%
+  select(-pathlength.x) %>%
+  rename(pathlength = pathlength.y)
+```
+
+### Landcover by catchemnt 
+```{r}
+nlcd_object <- nlcd_co
+#Get land cover for every catchment 
+sp_catchment_id <- sp_catchment %>%
+  mutate(row = row_number())
+
+whole_catch <- sp_catchment_id
+
+define_land_by_catch <- function(catch, row) {
+
+whole_catch <- catch[row,] %>%
+  st_transform(5070)
+
+fetid <- pull(whole_catch, featureid)
+    
+catch_extent <- extent(whole_catch)
+
+nlcd_crop <- crop(nlcd_object, catch_extent) 
+
+nlcd_mask <- mask(nlcd_crop, whole_catch) 
+
+nlcd_trim <- trim(nlcd_mask) 
+
+values <- as.data.frame(getValues(nlcd_trim)) %>%
+  rename(id = 1) %>%
+  group_by(id) %>%
+  summarise(num = n()) %>%
+  filter(id != 0) %>%
+  full_join(legend) %>%
+  filter(!is.na(id))%>%
+  mutate(featureid = fetid) %>%
+  select(-id) 
+
+total <- sum(values$num, na.rm = T)
+
+fin <- values %>%
+  pivot_wider(names_from = type, values_from = num) %>%
+  mutate(Total = total)
+}
+
+# Us function 
+landcover_by_catchment <- define_land_by_catch(sp_catchment_id, 1)
+
+seq <- 1:4129
+for(i in seq) {
+  x <- i+1
+  shed <- define_land_by_catch(sp_catchment_id, x)
+  
+  landcover_by_catchment <- rbind(landcover_by_catchment, shed)
+}
+```
+
+### Percentages for river segments 
+```{r}
+
+#get percent land cover along river network 
+percecnt_along <- function(river_comid, flow_lines = flowline, watersheds = landcover_by_catchment) {
+
+
+up_stream <- get_UT(flow_lines, river_comid)
+
+up_segments <- flow_lines %>%
+  filter(comid %in% up_stream)
+
+catch <- watersheds %>%
+  filter(featureid %in% pull(up_segments, comid)) %>%
+  pivot_longer(cols = c("Evergreen Forest", "Shrub/Scrub", "Unclassified", "Open Water", "Perennial Snow/Ice", "Developed, Open Space", "Developed, Low Intensity", "Developed, Medium Intensity", "Developed, High Intensity", "Barren Land", "Deciduous Forest", "Mixed Forest", "Herbaceuous", "Hay/Pasture", "Cultivated Crops", "Woody Wetlands", "Emergent Herbaceuous Wetlands")) %>%
+  group_by(name) %>%
+  summarise(num = sum(value, na.rm = T)) %>%
+  mutate(num = as.numeric(num)) 
+
+total <- sum(catch$num) 
+
+final <- catch %>%
+  mutate(Total = total) %>%
+  mutate(percent = (num/Total)*100) %>%
+  mutate(percent = round(percent, 5)) %>%
+  select(name, percent) %>%
+  mutate(comid = river_comid) %>%
+  pivot_wider(names_from = name, values_from = percent)
+}
+
+#use loop to do for all river segments 
+platte_comids <- pull(platte, ID)
+
+percents <- percecnt_along(platte_comids[1])
+
+seq <- 1:157
+for(i in seq) {
+  new <- percecnt_along(platte_comids[i+1]) 
+  
+  percents <- rbind(new, percents)
+}
+
+percent_along_river <- percents %>%
+  rename(barren = 2,
+         crops = 3,
+         deciduous = 4,
+         developed_high = 5,
+         developed_low = 6,
+         developed_mid = 7,
+         developed_open = 8,
+         wetland_herbaceous = 9,
+         evergreen = 10,
+         hay_pasture = 11,
+         herbaceous = 12,
+         forest_mixed = 13,
+         water = 14,
+         ice = 15,
+         shrub = 16,
+         wetland_wood = 18) %>%
+  select(-Unclassified)
+
+landcover_sumz <- percent_along_river %>%
+  mutate(developed = developed_high+developed_low+developed_mid,
+         forest = forest_mixed+deciduous+evergreen,
+         wetland = wetland_herbaceous+wetland_wood,
+         agriculture = crops+hay_pasture) %>%
+  select(-developed_high, -developed_mid, -developed_low, -forest_mixed, -deciduous, -evergreen, -wetland_herbaceous, -wetland_wood, -crops, - hay_pasture) 
+```
+
+## get location of WWTP on river 
+```{r}
+platte_trans <- platte %>%
+  mutate(pathlength = 281.122-pathlength) %>%
+  rename(comid = ID) 
+
+filter_sp_wwtp <- sewage %>%
+  filter(STATE_WATER_BODY_NAME %in% c("SOUTH PLATTE RIVER", "South Platte River", "storm sewer-South Platte River"))
+
+sp_wwtp_buff <- filter_sp_wwtp %>%
+  st_buffer(250)
+
+sp_wwtp <- st_join(platte_trans, sp_wwtp_buff) %>%
+  filter(!is.na(CWP_NAME))
+
+sp_sweage_codes <- sp_wwtp %>%
+  pull(pathlength)
+
+```
+
+## Join E.coil to landcover 
+```{r}
+sp_jumps <- st_join(platte_trans, ecoli_mean_sf_100m)
+
+sp_jumps_fil <- sp_jumps %>%
+  as.data.frame() %>%
+  full_join(landcover_sumz, by = "comid") %>%
+  select(-geometry) %>%
+  filter(!is.na(pathlength)) %>%
+  select(pathlength, mean, herbaceous, shrub, developed, forest, wetland, agriculture) %>%
+  mutate(mean = mean/50) %>%
+   pivot_longer(cols = c(herbaceous, shrub, developed, forest, wetland, agriculture))
+
+ggplot(sp_jumps_fil, aes(x = pathlength, y = value, colour = name)) +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  geom_vline(xintercept = sp_sweage_codes) +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+
+
+write_rds(sp_jumps_fil, "data_out/south_platte.rds")
+
+
+#ag, developed, forest, herb, shrub, wet
+```
+
+
+# Poudre 
+## nhd 
+```{r}
+poudre_start <- st_sfc(st_point(c(-104.600462, 40.423795)), crs = 4269)
+poudre_comid <- discover_nhdplus_id(poudre_start)
+
+poudre_flowline <- navigate_nldi(list(featureSource = "comid", 
+                               featureID = poudre_comid), 
+                          mode = "upstreamTributaries", 
+                          data_source = "")
+
+
+poudre_subset <- subset_nhdplus(comids = poudre_flowline$nhdplus_comid,
+                         output_file = "nhd/subset.gpkg",
+                         nhdplus_data = "download", 
+                         return_data = TRUE, 
+                         overwrite = T)
+
+
+poudre_flowline <- poudre_subset$NHDFlowline_Network
+poudre_catchment <- poudre_subset$CatchmentSP
+spoudre_waterbody <- poudre_subset$NHDWaterbody
+
+
+poudre <- poudre_flowline %>%
+  filter(gnis_name == "Cache la Poudre River")
+
+poudre_prep <- prepare_nhdplus(poudre_flowline, min_network_size = 10, min_path_length = 10) %>%
+  select(ID = COMID, toID = toCOMID, length = LENGTHKM)
+
+poudre_pathlength <- get_pathlength(poudre_prep)
+
+poudre_length <- poudre_flowline %>%
+  rename(ID = comid) %>%
+  right_join(poudre_pathlength, by = "ID")
+
+poudre <- poudre_length %>%
+  filter(gnis_name == "Cache la Poudre River") %>%
+  st_transform(4269) %>%
+  select(-pathlength.x) %>%
+  rename(pathlength = pathlength.y)
+```
+
+### Landcover by catchemnt 
+```{r}
+nlcd_object <- nlcd_co
+#Get land cover for every catchment 
+poudre_catchment_id <- poudre_catchment %>%
+  mutate(row = row_number())
+
+whole_catch <- poudre_catchment_id
+
+# Us function 
+poudre_landcover_by_catchment <- define_land_by_catch(poudre_catchment_id, 1)
+
+seq <- 1:1795
+for(i in seq) {
+  x <- i+1
+  shed <- define_land_by_catch(poudre_catchment_id, x)
+  
+  poudre_landcover_by_catchment <- rbind(poudre_landcover_by_catchment, shed)
+}
+```
+
+### Percentages for river segments 
+```{r}
+landcover_by_catchment <- poudre_landcover_by_catchment
+
+flowline <- poudre_flowline
+#use loop to do for all river segments 
+poudre_comids <- pull(poudre, ID)
+
+poudre_percents <- percecnt_along(poudre_comids[1])
+
+seq <- 1:120
+for(i in seq) {
+  new <- percecnt_along(poudre_comids[i+1]) 
+  
+  poudre_percents <- rbind(new, poudre_percents)
+}
+
+poudre_percent_along_river <- poudre_percents %>%
+  rename(barren = 2,
+         crops = 3,
+         deciduous = 4,
+         developed_high = 5,
+         developed_low = 6,
+         developed_mid = 7,
+         developed_open = 8,
+         wetland_herbaceous = 9,
+         evergreen = 10,
+         hay_pasture = 11,
+         herbaceous = 12,
+         forest_mixed = 13,
+         water = 14,
+         ice = 15,
+         shrub = 16,
+         wetland_wood = 18) %>%
+  select(-Unclassified)
+
+poudre_landcover_sumz <- poudre_percent_along_river %>%
+  mutate(developed = developed_high+developed_low+developed_mid,
+         forest = forest_mixed+deciduous+evergreen,
+         wetland = wetland_herbaceous+wetland_wood,
+         agriculture = crops+hay_pasture) %>%
+  select(-developed_high, -developed_mid, -developed_low, -forest_mixed, -deciduous, -evergreen, -wetland_herbaceous, -wetland_wood, -crops, - hay_pasture) 
+```
+
+## get location of WWTP on river 
+```{r}
+poudre_trans <- poudre %>%
+  mutate(pathlength = 199.874-pathlength) %>%
+  rename(comid = ID) %>%
+  st_transform(2163) 
+
+filter_poudre_wwtp <- sewage %>%
+  filter(STATE_WATER_BODY_NAME %in% c("CACHE LA POUDRE RIVER", "Cache La Poudre River -South Platte River", "Cache La Poudre River", "CACHE LA POUDRE, FOSSIL CREEK DITCH"))
+
+poudre_wwtp_buff <- filter_poudre_wwtp %>%
+  st_buffer(250)
+
+
+poudre_wwtp <- st_join(poudre_trans, poudre_wwtp_buff) %>%
+  filter(!is.na(CWP_NAME))
+
+poudre_sweage_codes <- poudre_wwtp %>%
+  pull(pathlength)
+
+```
+
+## Join E.coil to landcover 
+```{r}
+poudre_jumps <- st_join(poudre_trans, ecoli_mean_sf_100m)
+
+pudre_jumps_fil <- poudre_jumps %>%
+  as.data.frame() %>%
+  full_join(poudre_landcover_sumz, by = "comid") %>%
+  select(-geometry) %>%
+  filter(!is.na(pathlength)) %>%
+  select(pathlength, mean, herbaceous, shrub, developed, forest, wetland, agriculture) %>%
+  mutate(mean = mean/50) %>%
+   pivot_longer(cols = c(herbaceous, shrub, developed, forest, wetland, agriculture))
+
+write_rds(pudre_jumps_fil, "data_out/poudre.rds")
+
+ggplot(pudre_jumps_fil, aes(x = pathlength, y = value, colour = name)) +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  geom_vline(xintercept = poudre_sweage_codes) +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+
+
+#ag, developed, forest, herb, shrub, wet
+```
+
+# Big THompson 
+## nhd 
+```{r}
+bt_start <- st_sfc(st_point(c(-104.761314, 40.354054)), crs = 4269)
+bt_comid <- discover_nhdplus_id(bt_start)
+
+bt_flowline <- navigate_nldi(list(featureSource = "comid", 
+                               featureID = bt_comid), 
+                          mode = "upstreamTributaries", 
+                          data_source = "")
+
+
+bt_subset <- subset_nhdplus(comids = bt_flowline$nhdplus_comid,
+                         output_file = "nhd/subset.gpkg",
+                         nhdplus_data = "download", 
+                         return_data = TRUE, 
+                         overwrite = T)
+
+
+bt_flowline <- bt_subset$NHDFlowline_Network
+bt_catchment <- bt_subset$CatchmentSP
+bt_waterbody <- bt_subset$NHDWaterbody
+
+
+bt <- bt_flowline %>%
+  filter(comid %in% bt_main)
+
+bt_prep <- prepare_nhdplus(bt_flowline, min_network_size = 10, min_path_length = 10) %>%
+  select(ID = COMID, toID = toCOMID, length = LENGTHKM)
+
+bt_main <- get_UM(bt_flowline, 14962)
+
+bt <- bt_flowline %>%
+  filter(comid %in% bt_main)
+
+bt_pathlength <- get_pathlength(bt_prep)
+
+bt_length <- bt_flowline %>%
+  rename(ID = comid) %>%
+  right_join(bt_pathlength, by = "ID")
+
+bt <- bt_length %>%
+  filter(ID %in% bt_main) %>%
+  st_transform(4269) %>%
+  select(-pathlength.x) %>%
+  rename(pathlength = pathlength.y)
+```
+
+### Landcover by catchemnt 
+```{r}
+#Get land cover for every catchment 
+bt_catchment_id <- bt_catchment %>%
+  mutate(row = row_number())
+
+whole_catch <- bt_catchment_id
+
+# Us function 
+bt_landcover_by_catchment <- define_land_by_catch(bt_catchment_id, 1)
+
+seq <- 1:62
+for(i in seq) {
+  x <- i+1
+  shed <- define_land_by_catch(bt_catchment_id, x)
+  
+  bt_landcover_by_catchment <- rbind(bt_landcover_by_catchment, shed)
+}
+```
+
+### Percentages for river segments 
+```{r}
+landcover_by_catchment <- bt_landcover_by_catchment
+
+flowline <- bt_flowline
+#use loop to do for all river segments 
+bt_comids <- pull(bt, ID)
+
+bt_percents <- percecnt_along(bt_comids[1])
+
+seq <- 1:61
+for(i in seq) {
+  new <- percecnt_along(bt_comids[i+1]) 
+  
+  bt_percents <- rbind(new, bt_percents)
+}
+
+bt_percent_along_river <- bt_percents %>%
+  rename(barren = 2,
+         crops = 3,
+         deciduous = 4,
+         developed_high = 5,
+         developed_low = 6,
+         developed_mid = 7,
+         developed_open = 8,
+         wetland_herbaceous = 9,
+         evergreen = 10,
+         hay_pasture = 11,
+         herbaceous = 12,
+         forest_mixed = 13,
+         water = 14,
+         ice = 15,
+         shrub = 16,
+         wetland_wood = 18) %>%
+  select(-Unclassified)
+
+bt_landcover_sumz <- bt_percent_along_river %>%
+  mutate(developed = developed_high+developed_low+developed_mid,
+         forest = forest_mixed+deciduous+evergreen,
+         wetland = wetland_herbaceous+wetland_wood,
+         agriculture = crops+hay_pasture) %>%
+  select(-developed_high, -developed_mid, -developed_low, -forest_mixed, -deciduous, -evergreen, -wetland_herbaceous, -wetland_wood, -crops, - hay_pasture) 
+```
+
+## get location of WWTP on river 
+```{r}
+bt_trans <- bt %>%
+  mutate(pathlength = 116.551-pathlength) %>%
+  rename(comid = ID) %>%
+  st_transform(2163) 
+
+filter_bt_wwtp <- sewage %>%
+  filter(STATE_WATER_BODY_NAME %in% c("THOMPSON RIVER", "Big Thompson River - South Platte River"))
+
+bt_wwtp_buff <- sewage %>%
+  st_buffer(250)
+
+
+bt_wwtp <- st_join(bt_trans, bt_wwtp_buff) %>%
+  filter(!is.na(CWP_NAME))
+
+bt_sweage_codes <- bt_wwtp %>%
+  pull(pathlength)
+
+```
+
+## Join E.coil to landcover 
+```{r}
+bt_jumps <- st_join(bt_trans, ecoli_mean_sf_100m)
+
+bt_jumps_fil <- bt_jumps %>%
+  as.data.frame() %>%
+  full_join(bt_landcover_sumz, by = "comid") %>%
+  select(-geometry) %>%
+  filter(!is.na(pathlength)) %>%
+  select(pathlength, mean, herbaceous, shrub, developed, forest, wetland, agriculture) %>%
+  mutate(mean = mean/50) %>%
+   pivot_longer(cols = c(herbaceous, shrub, developed, forest, wetland, agriculture))
+
+ggplot(bt_jumps_fil, aes(x = pathlength, y = value, colour = name)) +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  geom_vline(xintercept = bt_sweage_codes) +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+
+write_rds(bt_jumps_fil, "data_out/big_thompson.rds")
+
+#ag, developed, forest, herb, shrub, wet
+```
+
+
+# Fountain
+## nhd 
+```{r}
+fountain_start <- st_sfc(st_point(c(-104.589736, 38.254237)), crs = 4269)
+fountain_comid <- discover_nhdplus_id(fountain_start)
+
+fountain_flowline <- navigate_nldi(list(featureSource = "comid", 
+                               featureID = fountain_comid), 
+                          mode = "upstreamTributaries", 
+                          data_source = "")
+
+
+fountain_subset <- subset_nhdplus(comids = fountain_flowline$nhdplus_comid,
+                         output_file = "nhd/subset.gpkg",
+                         nhdplus_data = "download", 
+                         return_data = TRUE, 
+                         overwrite = T)
+
+
+fountain_flowline <- fountain_subset$NHDFlowline_Network
+fountain_catchment <- fountain_subset$CatchmentSP
+fountain_waterbody <- fountain_subset$NHDWaterbody
+
+
+fountain <- fountain_flowline %>%
+  filter(gnis_name == "Fountain Creek")
+
+fountain_prep <- prepare_nhdplus(fountain_flowline, min_network_size = 10, min_path_length = 10) %>%
+  select(ID = COMID, toID = toCOMID, length = LENGTHKM)
+
+fountain_pathlength <- get_pathlength(fountain_prep)
+
+fountain_length <- fountain_flowline %>%
+  rename(ID = comid) %>%
+  right_join(fountain_pathlength, by = "ID")
+
+fountain <- fountain_length %>%
+  filter(gnis_name == "Fountain Creek") %>%
+  st_transform(4269) %>%
+  select(-pathlength.x) %>%
+  rename(pathlength = pathlength.y)
+```
+
+### Landcover by catchemnt 
+```{r}
+#Get land cover for every catchment 
+fountain_catchment_id <- fountain_catchment %>%
+  mutate(row = row_number())
+
+whole_catch <- fountain_catchment_id
+
+# Us function 
+fountain_landcover_by_catchment <- define_land_by_catch(fountain_catchment_id, 1)
+
+seq <- 1:1247
+for(i in seq) {
+  x <- i+1
+  shed <- define_land_by_catch(fountain_catchment_id, x)
+  
+  fountain_landcover_by_catchment <- rbind(fountain_landcover_by_catchment, shed)
+}
+```
+
+### Percentages for river segments 
+```{r}
+landcover_by_catchment <- fountain_landcover_by_catchment
+
+flowline <- fountain_flowline
+#use loop to do for all river segments 
+fountain_comids <- pull(fountain, ID)
+
+fountain_percents <- percecnt_along(fountain_comids[1])
+
+seq <- 1:260
+for(i in seq) {
+  new <- percecnt_along(fountain_comids[i+1]) 
+  
+  fountain_percents <- rbind(new, fountain_percents)
+}
+
+fountain_percent_along_river <- fountain_percents %>%
+  rename(barren = 2,
+         crops = 3,
+         deciduous = 4,
+         developed_high = 5,
+         developed_low = 6,
+         developed_mid = 7,
+         developed_open = 8,
+         wetland_herbaceous = 9,
+         evergreen = 10,
+         hay_pasture = 11,
+         herbaceous = 12,
+         forest_mixed = 13,
+         water = 14,
+         ice = 15,
+         shrub = 16,
+         wetland_wood = 18) %>%
+  select(-Unclassified)
+
+fountain_landcover_sumz <- fountain_percent_along_river %>%
+  mutate(developed = developed_high+developed_low+developed_mid,
+         forest = forest_mixed+deciduous+evergreen,
+         wetland = wetland_herbaceous+wetland_wood,
+         agriculture = crops+hay_pasture) %>%
+  select(-developed_high, -developed_mid, -developed_low, -forest_mixed, -deciduous, -evergreen, -wetland_herbaceous, -wetland_wood, -crops, - hay_pasture) 
+```
+
+## get location of WWTP on river 
+```{r}
+fountain_trans <- fountain %>%
+  mutate(pathlength = 111.546-pathlength) %>%
+  rename(comid = ID) %>%
+  st_transform(2163) 
+
+filter_fountain_wwtp <- sewage %>%
+  filter(STATE_WATER_BODY_NAME %in% c("FOUNTAIN CREEK", "Fountain Creek -Arkansas River", "FOUNTAIN CR, MONUMENT CR, IRR DITCH"))
+
+fountain_wwtp_buff <- filter_fountain_wwtp %>%
+  st_buffer(250)
+
+
+fountain_wwtp <- st_join(fountain_trans, fountain_wwtp_buff) %>%
+  filter(!is.na(CWP_NAME))
+
+fountain_sweage_codes <- fountain_wwtp %>%
+  pull(pathlength)
+
+```
+
+## Join E.coil to landcover 
+```{r}
+fountain_jumps <- st_join(fountain_trans, ecoli_mean_sf_100m)
+
+fountain_jumps_fil <- fountain_jumps %>%
+  as.data.frame() %>%
+  full_join(fountain_landcover_sumz, by = "comid") %>%
+  select(-geometry) %>%
+  filter(!is.na(pathlength)) %>%
+  select(pathlength, mean, herbaceous, shrub, developed, forest, wetland, agriculture) %>%
+  mutate(mean = mean/50) %>%
+   pivot_longer(cols = c(herbaceous, shrub, developed, forest, wetland, agriculture))
+
+ggplot(fountain_jumps_fil, aes(x = pathlength, y = value, colour = name)) +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  geom_vline(xintercept = fountain_sweage_codes) +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+
+write_rds(fountain_jumps_fil, "data_out/fountain.rds")
+
+#ag, developed, forest, herb, shrub, wet
+```
+
+```{r}
+
+```
+
+# function
+## nhd 
+```{r}
+lat <- 40.647599 
+long <- -105.173573
+river_longitudinal <- function(lat, long) {
+start <- st_sfc(st_point(c(long, lat)), crs = 4269)
+start_comid <- discover_nhdplus_id(start)
+
+river_flowline <- navigate_nldi(list(featureSource = "comid", 
+                               featureID = start_comid), 
+                          mode = "upstreamTributaries", 
+                          data_source = "")
+
+
+river_subset <- subset_nhdplus(comids = river_flowline$nhdplus_comid,
+                         output_file = "nhd/subset.gpkg",
+                         nhdplus_data = "download", 
+                         return_data = TRUE, 
+                         overwrite = T)
+
+
+river_flowline <- river_subset$NHDFlowline_Network
+river_catchment <- river_subset$CatchmentSP
+river_waterbody <- river_subset$NHDWaterbody
+
+
+river_prep <- prepare_nhdplus(river_flowline, min_network_size = 10, min_path_length = 10) %>%
+  select(ID = COMID, toID = toCOMID, length = LENGTHKM)
+
+river_main <- get_UM(river_flowline, start_comid)
+
+river <- river_flowline %>%
+  filter(comid %in% river_main)
+
+river_pathlength <- get_pathlength(river_prep)
+
+river_length <- river_flowline %>%
+  rename(ID = comid) %>%
+  right_join(river_pathlength, by = "ID")
+
+riv <- river_length %>%
+  filter(ID %in% river_main) %>%
+  st_transform(4269) %>%
+  select(-pathlength.x) %>%
+  rename(pathlength = pathlength.y)
+
+#Get land cover for every catchment 
+river_catchment_id <- river_catchment %>%
+  mutate(row = row_number())
+
+whole_catch <- river_catchment_id
+
+# Us function 
+river_landcover_by_catchment <- define_land_by_catch(river_catchment_id, 1)
+
+land_length <- as.numeric(length(river_catchment_id$id))
+
+seqens <- 1:(land_length-1)
+for(i in seqens) {
+  x <- i+1
+  shed <- define_land_by_catch(river_catchment_id, x)
+  
+  river_landcover_by_catchment <- rbind(river_landcover_by_catchment, shed)
+}
+
+landcover_by_catchment <- river_landcover_by_catchment
+
+flowline <- river_flowline
+#use loop to do for all river segments 
+river_comids <- pull(riv, ID)
+
+river_percents <- percecnt_along(river_comids[1], flowline, landcover_by_catchment)
+
+comids_length <- as.numeric(length(river_comids)[1])
+
+seq <- 1:(comids_length-1)
+for(i in seq) {
+  new <- percecnt_along(river_comids[i+1], flowline, landcover_by_catchment) 
+  
+  river_percents <- rbind(new, river_percents)
+}
+
+river_percent_along_river <- river_percents %>%
+  rename(barren = 2,
+         crops = 3,
+         deciduous = 4,
+         developed_high = 5,
+         developed_low = 6,
+         developed_mid = 7,
+         developed_open = 8,
+         wetland_herbaceous = 9,
+         evergreen = 10,
+         hay_pasture = 11,
+         herbaceous = 12,
+         forest_mixed = 13,
+         water = 14,
+         ice = 15,
+         shrub = 16,
+         wetland_wood = 18) %>%
+  select(-Unclassified)
+
+river_landcover_sumz <- river_percent_along_river %>%
+  mutate(developed = developed_high+developed_low+developed_mid,
+         forest = forest_mixed+deciduous+evergreen,
+         wetland = wetland_herbaceous+wetland_wood,
+         agriculture = crops+hay_pasture) %>%
+  select(-developed_high, -developed_mid, -developed_low, -forest_mixed, -deciduous, -evergreen, -wetland_herbaceous, -wetland_wood, -crops, - hay_pasture) 
+
+max_length <- max(riv$pathlength)
+
+riv_trans <- riv %>%
+  mutate(pathlength = max_length-pathlength) %>%
+  rename(comid = ID) %>%
+  st_transform(2163) 
+
+wwtp_buff <- sewage %>%
+  st_buffer(250)
+
+
+river_wwtp <- st_join(riv_trans, wwtp_buff) %>%
+  filter(!is.na(CWP_NAME))
+
+river_sweage_codes <- river_wwtp %>%
+  pull(pathlength)
+
+riv_jumps <- st_join(riv_trans, ecoli_mean_sf_100m)
+
+riv_jumps_fil <- riv_jumps %>%
+  as.data.frame() %>%
+  full_join(river_landcover_sumz, by = "comid") %>%
+  select(-geometry) %>%
+  filter(!is.na(pathlength)) %>%
+  select(pathlength, mean, herbaceous, shrub, developed, forest, wetland, agriculture) %>%
+  mutate(mean = mean/50) %>%
+   pivot_longer(cols = c(herbaceous, shrub, developed, forest, wetland, agriculture))
+
+fin <- list(full = riv_jumps_fil,
+     wwtp = river_sweage_codes)
+
+}
+```
+
+
+
+
+```{r}
+poudre_test <- river_longitudinal(lat = 40.423795, long = -104.600462)
+
+bt_test <- river_longitudinal(40.354054, -104.761314)
+
+ggplot(bt_test, aes(x = pathlength, y = value, colour = name)) +
+  geom_line() +
+  geom_point(aes(x = pathlength, y = mean)) +
+  scale_color_manual(values = c("#252525", "#e7298a", "#66a61e", "#7570b3", "#d95f02", "#1b9e77"), 
+                     breaks = c("herbaceous", "shrub", "forest", "wetland", "agriculture", "developed"),
+                     name = "Landcover") +
+  scale_y_continuous(sec.axis = sec_axis(trans = ~.*50,  name = "E.coli (#/ml)")) +
+  theme_few() +
+  geom_vline(xintercept = poudre_test[["wwtp"]]) +
+  labs(x = "Length on River", y = "Watershed landcover (%)")
+```
+
+
+
+
+

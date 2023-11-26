@@ -1,0 +1,324 @@
+---
+title: "data_availability"
+author: "Spencer Rhea"
+date: "7/8/2020"
+output: 
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+library(raster)
+library(feather)
+library(tidyverse)
+library(stringr)
+library(ggpubr)
+library(viridis)
+library(sf)
+library(FedData)
+library(mapview)
+library(lubridate)
+library(feather)
+library(tidycensus)
+library(USAboundaries)
+library(ggthemes)
+library(ggplot2)
+library(kableExtra)
+library(knitr)
+library(tmap)
+library(tmaptools)
+library(RColorBrewer)
+library(nhdplusTools)
+```
+
+
+```{r, include=FALSE}
+# Read in raw e.coli data
+ecoli_raw <- read_feather("/Users/spencerrhea/Google Drive/EJ_paper /data/wq_data/Colorado_ecoli.feather")
+
+# Read in inventory
+inv <- read_feather('/Users/spencerrhea/Google Drive/EJ_paper /data/wq_data/test/wqp_inv.feather') %>%
+    select(SiteID=MonitoringLocationIdentifier,
+           resultCount,
+           parameter,
+                  lat,
+                  lon) %>%
+  distinct() %>%
+  filter(!is.na(lat),
+         !is.na(lon)) %>%
+  st_as_sf(.,coords=c('lon','lat'),crs=4326) %>%
+  distinct(SiteID)
+
+# clean e.coli data
+clean_ecoli <-  ecoli_raw %>%
+                  dplyr::select(date=ActivityStartDate,
+                         parameter=CharacteristicName,
+                         units=ResultMeasure.MeasureUnitCode,
+                         SiteID=MonitoringLocationIdentifier,
+                         org=OrganizationFormalName,
+                         org_id=OrganizationIdentifier,
+                         time=ActivityStartTime.Time,
+                         raw_value=ResultMeasureValue,
+                         sample_method=SampleCollectionMethod.MethodName,
+                         analytical_method=ResultAnalyticalMethod.MethodName,
+                         particle_size=ResultParticleSizeBasisText,
+                         date_time=ActivityStartDateTime,
+                         media=ActivityMediaName,
+                         sample_depth=ActivityDepthHeightMeasure.MeasureValue,
+                         sample_depth_unit=ActivityDepthHeightMeasure.MeasureUnitCode,
+                         fraction=ResultSampleFractionText,
+                         status=ResultStatusIdentifier) %>%
+  mutate(units = trimws(units)) %>%
+  #Keep only samples that are water samples
+  filter(media=='Water') %>%
+  filter(units != "ug/l")
+
+# Removed filter for log mean 
+ecoli_mean <- clean_ecoli %>%
+  filter(year(date) >= 2005 & year(date) <= 2015) %>%
+  filter(parameter == "Escherichia coli") %>%
+  group_by(SiteID) %>%
+  summarize(mean = mean(raw_value,na.rm=T) %>% round(.,2),
+            raw_mean = mean(raw_value,na.rm=T),
+            sd = sd(raw_value, na.rm = T),
+            count=n()) %>%
+  filter(count > 9) %>% 
+  #filter(sd < 5) %>%
+  mutate(log_mean=log10(mean)) %>%
+  filter(log_mean > 0.0000001)
+
+ecoli_mean_sf <- inv %>%
+  right_join(.,ecoli_mean,by='SiteID') %>%
+  st_transform(2163) 
+
+ecoli_mean_sf_100m <- ecoli_mean_sf %>%
+  st_buffer(100)
+
+ecoli_3km <- ecoli_mean_sf %>%
+  st_buffer(3000)
+```
+
+
+```{r, include=FALSE}
+# Ecoli avalibility 
+nhd <- st_read('/Users/spencerrhea/Google Drive/EJ_paper /data/nhd/NHDPlus/download.gpkg', "NHDFlowline_Network")
+
+nhd_bodies <- st_read('/Users/spencerrhea/Google Drive/EJ_paper /data/nhd/NHDPlus/download.gpkg', "NHDWaterbody")
+
+fr_census <- read_rds("/Users/spencerrhea/Google Drive/EJ_paper /data/census_fr.rds")
+
+nhd_order <- nhd %>%
+  st_transform(2163) %>%
+  filter(streamorde > 2) 
+
+nhd_bodies_trans <- nhd_bodies %>%
+  filter(ftype != "Ice Mass") %>%
+  st_transform(2163)
+
+#Gen number of river segments in block group
+data_avail <- fr_census %>%
+  st_buffer(3000) %>%
+  st_join(nhd_order) %>%
+  group_by(GEOID) %>%
+  summarise(num = n(),
+            length = sum(lengthkm, na.rm = T)) %>%
+  mutate(num = ifelse(length <= 0.001, 0, num))
+
+#number of lakes near block groups 
+data_bodies <- fr_census %>%
+  st_buffer(3000) %>%
+  st_join(nhd_bodies_trans) %>%
+  group_by(GEOID) %>%
+  summarise(lakes = n(),
+            area = sum(areasqkm, na.rm = T)) %>%
+  mutate(lakes = ifelse(area <= 0.0001, 0, lakes))
+
+#combine lakes and streams 
+data_full <- data_avail %>%
+  as.data.frame() %>%
+  select(-geometry) %>%
+  full_join(as.data.frame(data_bodies), by = "GEOID") %>%
+  select(-geometry) %>%
+  mutate(water = ifelse(lakes == 0 & num == 0, "no", "yes"))
+
+#Get city boundries
+city_geom <- get_acs(geography = "metropolitan statistical area/micropolitan statistical area", variables = "B01003_001", year = 2013, geometry = T) %>%
+  filter(NAME %in% c("Fort Collins, CO Metro Area", "Denver-Aurora-Lakewood, CO Metro Area", "Colorado Springs, CO Metro Area", "Pueblo, CO Metro Area", 'Boulder, CO Metro Area')) %>%
+  st_transform(2163) %>%
+  mutate(NAME = case_when(NAME == "Fort Collins, CO Metro Area" ~ "fort_collins",
+                          NAME == "Denver-Aurora-Lakewood, CO Metro Area" ~ "denver",
+                          NAME == "Colorado Springs, CO Metro Area" ~ "colo_spgs",
+                          NAME == "Pueblo, CO Metro Area" ~ "pueblo",
+                          NAME == "Boulder, CO Metro Area" ~ "boulder")) %>%
+  rename(city = NAME) %>%
+  select(city, geometry)
+
+fr_census_city <- st_join(fr_census, city_geom)
+
+
+
+#join nhd to census 
+ecoli_avail <- st_join(fr_census_city, ecoli_3km) %>%
+  mutate(data_avail = ifelse(!is.na(mean),'has_data','no_data')) %>%
+  mutate(data_avail = as.factor(data_avail)) %>%
+  as.data.frame() %>%
+  select(-geometry)
+
+ecoli_water <- full_join(data_full, ecoli_avail, by = "GEOID") %>%
+  mutate(percent_color = color/population,
+         percent_renters = renters/tenure_total,
+         percent_degrees = degrees/education_25_total) 
+```
+
+```{r, include=FALSE}
+ecoli_water_long <- ecoli_water %>%
+  select(water, POC=percent_color, renters=percent_renters, degrees=percent_degrees, income=median_income, water, city) %>%
+  pivot_longer(cols = c(POC, renters, degrees, income)) %>%
+  filter(!is.na(value))
+```
+
+## Block groups within 3km of a waterbody
+### POC
+```{r, include=TRUE, warning=FALSE}
+ecoli_water_long_p <- ecoli_water_long %>%
+  filter(name == "POC") %>% 
+  filter(!is.na(city))
+
+ggplot(ecoli_water_long_p, aes(x = water, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~city) +
+  labs(x = "3km within a waterbody", y = "Proportion POC")
+```
+
+### Medain Household Income 
+```{r, include=TRUE, warning=FALSE}
+ecoli_water_long_i <- ecoli_water_long %>%
+  filter(name == "income") %>% 
+  filter(!is.na(city))
+
+ggplot(ecoli_water_long_i, aes(x = water, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~city) +
+  labs(x = "3km within a waterbody", y = "Median household income")
+```
+
+### College degrees
+```{r, include=TRUE, warning=FALSE}
+ecoli_water_long_d <- ecoli_water_long %>%
+  filter(name == "degrees") %>% 
+  filter(!is.na(city))
+
+ggplot(ecoli_water_long_d, aes(x = water, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~city) +
+  labs(x = "3km within a waterbody", y = "Proportion degrees")
+```
+
+### Renters 
+```{r, include=TRUE, warning=FALSE}
+ecoli_water_long_r <- ecoli_water_long %>%
+  filter(name == "renters") %>% 
+  filter(!is.na(city))
+
+ggplot(ecoli_water_long_r, aes(x = water, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~city) +
+  labs(x = "3km within a waterbody", y = "Proportion renters")
+```
+
+
+
+```{r}
+ecoli_water_sub <- ecoli_water %>%
+  filter(water == "yes") %>%
+  select(data_avail, city, POC=percent_color, renters=percent_renters, degrees=percent_degrees, income=median_income, water) %>%
+  pivot_longer(cols = c(POC, renters, degrees, income))
+
+```
+
+## E.coli data availability
+### POC
+```{r, include=TRUE, warning=FALSE}
+ecoli_water_sub_p <- ecoli_water_sub %>%
+  filter(name == "POC") %>% 
+  filter(!is.na(city))
+
+ggplot(ecoli_water_sub_p, aes(x = data_avail, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~city) +
+  labs(x = "E.coli data available", y = "Proportion POC")
+```
+
+### Medain Household Income 
+```{r, include=TRUE, warning=FALSE}
+ecoli_water_sub_i <- ecoli_water_sub %>%
+  filter(name == "income") %>% 
+  filter(!is.na(city))
+
+ggplot(ecoli_water_sub_i, aes(x = data_avail, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~city) +
+  labs(x = "E.coli data available", y = "Median household income")
+```
+
+### College degrees
+```{r, include=TRUE, warning=FALSE}
+ecoli_water_sub_d <- ecoli_water_sub%>%
+  filter(name == "degrees") %>% 
+  filter(!is.na(city))
+
+ggplot(ecoli_water_sub_d, aes(x = data_avail, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~city) +
+  labs(x = "E.coli data available", y = "Proportion degrees")
+```
+
+### Renters 
+```{r, include=TRUE, warning=FALSE}
+ecoli_water_sub_r <- ecoli_water_sub %>%
+  filter(name == "renters") %>% 
+  filter(!is.na(city))
+
+ggplot(ecoli_water_sub_r, aes(x = data_avail, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~city) +
+  labs(x = "E.coli data available", y = "Proportion renters")
+```
+
+## 3km within lakes, rivers, or both
+### Whole front range 
+```{r}
+lakes_riv <- ecoli_water %>%
+  filter(water == "yes") %>%
+  mutate(lake = ifelse(lakes == 0, "no", "yes"),
+         river = ifelse(num == 0, "no", "yes")) %>%
+  mutate(type = case_when(lake == "yes" & river == "yes" ~ "both",
+                          lake == "yes" & river == "no" ~ "lake",
+                          lake == "no" & river == "yes" ~ "river")) %>%
+  select(type, POC=percent_color, renters=percent_renters, degrees=percent_degrees, income=median_income, water, city) %>%
+  pivot_longer(cols = c(POC, renters, degrees, income)) %>%
+  filter(!is.na(value))
+  
+
+ggplot(lakes_riv, aes(x = type, y = value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  theme_few() +
+  facet_wrap(~name, scales = "free") +
+  labs(x = "E.coli data available", y = "Proportion or income")
+```
+
+
